@@ -12,10 +12,6 @@ on:
         required: true
         type: string
         description: 'Git branch to pull from'
-      azure-credentials:
-        required: true
-        type: string
-        description: 'Azure credentials JSON'
       tenant-id:
         required: true
         type: string
