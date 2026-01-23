@@ -1,4 +1,4 @@
-#update-workspace-git.yml
+# .github/workflows/update-workspace-git.yml
 name: Update Workspace Git Integration
 
 on:
@@ -24,79 +24,90 @@ jobs:
   update-workspace:
     name: Update Workspace
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
-      
+
       - name: Get Fabric API Token
         id: get-token
+        env:
+          TENANT_ID: ${{ secrets.tenant-id }}
+          CLIENT_ID: ${{ secrets.client-id }}
+          CLIENT_SECRET: ${{ secrets.client-secret }}
         run: |
-          TOKEN_URL="https://login.microsoftonline.com/${{ inputs.tenant-id }}/oauth2/v2.0/token"
-          
-          RESPONSE=$(curl -s -X POST "$TOKEN_URL" \
+          set -euo pipefail
+
+          : "${TENANT_ID:?TENANT_ID is empty}"
+          : "${CLIENT_ID:?CLIENT_ID is empty}"
+          : "${CLIENT_SECRET:?CLIENT_SECRET is empty}"
+
+          TOKEN_URL="https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token"
+
+          RESPONSE=$(curl -sS -X POST "$TOKEN_URL" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "client_id=${{ inputs.client-id }}" \
-            -d "client_secret=${{ inputs.client-secret }}" \
-            -d "scope=https://api.fabric.microsoft.com/.default" \
-            -d "grant_type=client_credentials")
-          
+            --data-urlencode "client_id=${CLIENT_ID}" \
+            --data-urlencode "client_secret=${CLIENT_SECRET}" \
+            --data-urlencode "scope=https://api.fabric.microsoft.com/.default" \
+            --data-urlencode "grant_type=client_credentials")
+
           TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
-          
+
           if [[ -z "$TOKEN" ]]; then
             echo "Error: Failed to get access token"
-            echo "$RESPONSE" | jq '.'
+            echo "$RESPONSE" | jq '{error, error_description, trace_id, correlation_id}'
             exit 1
           fi
-          
+
           echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
           echo "Successfully obtained access token"
-      
+
       - name: Get Workspace Git Status
         id: git-status
         env:
           FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
+          set -euo pipefail
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
-          
+
           echo "Getting Git status for workspace: ${{ inputs.workspace-id }}"
-          
+
           RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
             "${FABRIC_API_URL}/workspaces/${{ inputs.workspace-id }}/git/status" \
             -H "Authorization: Bearer $FABRIC_TOKEN" \
             -H "Content-Type: application/json")
-          
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
-          
+
           if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
             echo "✓ Git status retrieved successfully"
             echo "$BODY" | jq '.'
-            
-            # Check if workspace is connected to Git
+
             IS_CONNECTED=$(echo "$BODY" | jq -r '.gitConnectionState // "NotConnected"')
-            echo "git_connected=$IS_CONNECTED" >> $GITHUB_OUTPUT
+            echo "git_connected=$IS_CONNECTED" >> "$GITHUB_OUTPUT"
           else
             echo "⚠ Warning: Could not get Git status. HTTP Code: $HTTP_CODE"
             echo "$BODY" | jq '.' || echo "$BODY"
-            echo "git_connected=NotConnected" >> $GITHUB_OUTPUT
+            echo "git_connected=NotConnected" >> "$GITHUB_OUTPUT"
           fi
-      
+
       - name: Connect Workspace to Git
         if: steps.git-status.outputs.git_connected == 'NotConnected'
         env:
           FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
+          set -euo pipefail
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
-          
+
           echo "Connecting workspace to Git repository..."
-          
+
           PAYLOAD=$(cat <<EOF
           {
             "gitProviderDetails": {
@@ -110,16 +121,16 @@ jobs:
           }
           EOF
           )
-          
+
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "${FABRIC_API_URL}/workspaces/${{ inputs.workspace-id }}/git/connect" \
             -H "Authorization: Bearer $FABRIC_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
-          
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
-          
+
           if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
             echo "✓ Workspace connected to Git successfully"
           else
@@ -127,48 +138,49 @@ jobs:
             echo "$BODY" | jq '.' || echo "$BODY"
             exit 1
           fi
-      
+
       - name: Update Git Branch
         if: steps.git-status.outputs.git_connected != 'NotConnected'
         env:
           FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
+          set -euo pipefail
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
-          
+
           echo "Updating workspace to branch: ${{ inputs.git-branch }}"
-          
+
           PAYLOAD=$(cat <<EOF
           {
             "branchName": "${{ inputs.git-branch }}"
           }
           EOF
           )
-          
+
           RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH \
             "${FABRIC_API_URL}/workspaces/${{ inputs.workspace-id }}/git/updateConnection" \
             -H "Authorization: Bearer $FABRIC_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
-          
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
-          
+
           if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
             echo "✓ Git branch updated successfully"
           else
             echo "⚠ Warning: Failed to update branch. HTTP Code: $HTTP_CODE"
             echo "$BODY" | jq '.' || echo "$BODY"
-            # Don't fail - connection might already be on correct branch
           fi
-      
+
       - name: Commit to Workspace
         env:
           FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
+          set -euo pipefail
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
-          
+
           echo "Committing changes from workspace to Git..."
-          
+
           PAYLOAD=$(cat <<EOF
           {
             "mode": "All",
@@ -176,32 +188,32 @@ jobs:
           }
           EOF
           )
-          
+
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "${FABRIC_API_URL}/workspaces/${{ inputs.workspace-id }}/git/commitToGit" \
             -H "Authorization: Bearer $FABRIC_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
-          
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
-          
+
           if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
             echo "✓ Changes committed to Git successfully"
           else
             echo "⚠ Info: No changes to commit or commit failed. HTTP Code: $HTTP_CODE"
             echo "$BODY" | jq '.' || echo "$BODY"
-            # Don't fail - might not have changes
           fi
-      
+
       - name: Update from Git
         env:
           FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
+          set -euo pipefail
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
-          
+
           echo "Updating workspace from Git branch: ${{ inputs.git-branch }}"
-          
+
           PAYLOAD=$(cat <<EOF
           {
             "remoteCommitHash": "latest",
@@ -215,16 +227,16 @@ jobs:
           }
           EOF
           )
-          
+
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "${FABRIC_API_URL}/workspaces/${{ inputs.workspace-id }}/git/updateFromGit" \
             -H "Authorization: Bearer $FABRIC_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
-          
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
-          
+
           if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
             echo "✓ Workspace updated from Git successfully"
             echo "$BODY" | jq '.' || echo "$BODY"
@@ -233,28 +245,28 @@ jobs:
             echo "$BODY" | jq '.' || echo "$BODY"
             exit 1
           fi
-      
+
       - name: Get Updated Git Status
         env:
           FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
+          set -euo pipefail
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
-          
+
           echo "Getting updated Git status..."
-          
+
           RESPONSE=$(curl -s -X GET \
             "${FABRIC_API_URL}/workspaces/${{ inputs.workspace-id }}/git/status" \
             -H "Authorization: Bearer $FABRIC_TOKEN" \
             -H "Content-Type: application/json")
-          
+
           echo "Current Git Status:"
           echo "$RESPONSE" | jq '.'
-      
+
       - name: Summary
         run: |
           echo "### Workspace Update Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Workspace ID**: ${{ inputs.workspace-id }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Git Branch**: ${{ inputs.git-branch }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status**: Workspace updated from Git successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**
