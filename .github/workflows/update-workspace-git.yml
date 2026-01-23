@@ -112,8 +112,7 @@ jobs:
           {
             "gitProviderDetails": {
               "gitProviderType": "GitHub",
-              "organizationName": "${{ github.repository_owner }}",
-              "projectName": "${{ github.event.repository.name }}",
+              "ownerName": "${{ github.repository_owner }}",
               "repositoryName": "${{ github.event.repository.name }}",
               "branchName": "${{ inputs.git-branch }}",
               "directoryName": "/"
@@ -138,6 +137,7 @@ jobs:
             echo "$BODY" | jq '.' || echo "$BODY"
             exit 1
           fi
+
 
       - name: Update Git Branch
         if: steps.git-status.outputs.git_connected != 'NotConnected'
