@@ -3,7 +3,7 @@ name: Fabric Deployment Pipeline
 on:
   push:
     branches:
-      - 'feature/**'
+      - "feature/**"
       - dev
       - test
       - main
@@ -15,19 +15,17 @@ on:
   workflow_dispatch:
 
 env:
-  # WS_PREFIX: feat
-  
+  WS_PREFIX: feat
+
   # Ensure these are using 'vars', NOT 'secrets'
   DEV_CAPACITY_ID: ${{ vars.DEV_CAPACITY_ID }}
   TEST_CAPACITY_ID: ${{ vars.TEST_CAPACITY_ID }}
   PROD_CAPACITY_ID: ${{ vars.PROD_CAPACITY_ID }}
-  
   DEV_WORKSPACE_ID: ${{ vars.DEV_WORKSPACE_ID }}
   TEST_WORKSPACE_ID: ${{ vars.TEST_WORKSPACE_ID }}
   PROD_WORKSPACE_ID: ${{ vars.PROD_WORKSPACE_ID }}
-  
   GITHUB_REPOSITORY_NAME: ${{ github.event.repository.name }}
-  
+
   # If these are secrets, REMOVE them from here and pass them directly in the jobs
   FABRIC_CONNECTION_ID: ${{ vars.FABRIC_CONNECTION_ID }}
   WORKSPACE_ADMIN_ID: ${{ vars.WORKSPACE_ADMIN_ID }}
@@ -37,7 +35,7 @@ jobs:
   # 1. Validate Service Principal Permissions (New Step)
   # ══════════════════════════════════════════════════════════════
   check-spn-permissions:
-    name: '1. Validate SPN Permissions'
+    name: "1. Validate SPN Permissions"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -54,13 +52,12 @@ jobs:
         run: |
           ./.github/workflows/scripts/spn_evaluator.sh --output table
 
-
   # ══════════════════════════════════════════════════════════════
   # 0. Create feature workspace
   # ══════════════════════════════════════════════════════════════
   create-feature-workspace:
     name: Create Feature Workspace
-    needs: check-spn-permissions  # <--- Added Dependency
+    needs: check-spn-permissions
     if: startsWith(github.ref, 'refs/heads/feature/')
     uses: ./.github/workflows/create-fabric-workspace.yml
     with:
@@ -79,7 +76,7 @@ jobs:
   # 1. Feature → Dev: Create PR
   # ══════════════════════════════════════════════════════════════
   feature-to-dev-pr:
-    name: 'Feature → Dev PR'
+    name: "Feature → Dev PR"
     needs: create-feature-workspace
     if: startsWith(github.ref, 'refs/heads/feature/')
     uses: ./.github/workflows/create-gitflow-pr.yml
@@ -93,10 +90,27 @@ jobs:
       github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # ══════════════════════════════════════════════════════════════
+  # 4. Deploy to Dev Workspace
+  # ══════════════════════════════════════════════════════════════
+  deploy-to-dev:
+    name: Deploy to Dev
+    needs: check-spn-permissions
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
+      git-branch: dev
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
   # 2. Dev → Test: Create PR
   # ══════════════════════════════════════════════════════════════
   dev-to-test-pr:
-    name: 'Dev → Test PR'
+    name: "Dev → Test PR"
+    needs: deploy-to-dev
     if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
     uses: ./.github/workflows/create-gitflow-pr.yml
     with:
@@ -109,10 +123,27 @@ jobs:
       github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # ══════════════════════════════════════════════════════════════
+  # 5. Deploy to Test Workspace
+  # ══════════════════════════════════════════════════════════════
+  deploy-to-test:
+    name: Deploy to Test
+    needs: check-spn-permissions
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
+      git-branch: test
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
   # 3. Test → Main: Create PR
   # ══════════════════════════════════════════════════════════════
   test-to-main-pr:
-    name: 'Test → Main PR'
+    name: "Test → Main PR"
+    needs: deploy-to-test
     if: github.ref == 'refs/heads/test' && github.event_name == 'push'
     uses: ./.github/workflows/create-gitflow-pr.yml
     with:
@@ -125,43 +156,11 @@ jobs:
       github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # ══════════════════════════════════════════════════════════════
-  # 4. Deploy to Dev Workspace
-  # ══════════════════════════════════════════════════════════════
-  deploy-to-dev:
-    name: Deploy to Dev
-    needs: check-spn-permissions  # <--- Added Dependency
-    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
-    uses: ./.github/workflows/update-workspace-git.yml
-    with:
-      workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
-      git-branch: dev
-    secrets:
-      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-      client-id: ${{ secrets.AZURE_CLIENT_ID }}
-      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-
-  # ══════════════════════════════════════════════════════════════
-  # 5. Deploy to Test Workspace
-  # ══════════════════════════════════════════════════════════════
-  deploy-to-test:
-    name: Deploy to Test
-    needs: check-spn-permissions  # <--- Added Dependency
-    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
-    uses: ./.github/workflows/update-workspace-git.yml
-    with:
-      workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
-      git-branch: test
-    secrets:
-      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-      client-id: ${{ secrets.AZURE_CLIENT_ID }}
-      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-
-  # ══════════════════════════════════════════════════════════════
   # 6. Deploy to Production Workspace
   # ══════════════════════════════════════════════════════════════
   deploy-to-prod:
     name: Deploy to Production
-    needs: check-spn-permissions  # <--- Added Dependency
+    needs: check-spn-permissions
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     uses: ./.github/workflows/update-workspace-git.yml
     with:
