@@ -1,4 +1,4 @@
-#create-fabric-workspace.yml
+# .github/workflows/create-fabric-workspace.yml
 name: Create Fabric Workspace
 
 on:
@@ -28,20 +28,35 @@ on:
         required: true
         type: string
         description: 'Workspace admin user/group ID'
+    
+    # ---------------------------------------------------------
+    # 1. UPDATE: Changed from 'AZURE_CREDENTIALS' to individual secrets
+    # ---------------------------------------------------------
     secrets:
-      AZURE_CREDENTIALS:
+      AZURE_CLIENT_ID:
         required: true
+      AZURE_CLIENT_SECRET:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+
     outputs:
       workspace-id:
         description: 'ID of the created workspace'
+        # ---------------------------------------------------------
+        # 2. UPDATE: Matches the output key from the job below
+        # ---------------------------------------------------------
         value: ${{ jobs.create-workspace.outputs.workspace-id }}
 
 jobs:
   create-workspace:
     name: Create Workspace
     runs-on: ubuntu-latest
+    # ---------------------------------------------------------
+    # 3. UPDATE: Matches "echo workspace_id=... >> $GITHUB_OUTPUT" in script
+    # ---------------------------------------------------------
     outputs:
-      workspace-id: ${{ steps.create-ws.outputs.WS_ID }}
+      workspace-id: ${{ steps.create-ws.outputs.workspace-id }}
     
     steps:
       - name: Checkout repository
@@ -52,40 +67,49 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
       
-      - name: Azure Login
-        uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      
-      # ✅ CORRECTED: Fixed script paths
+
       - name: Make scripts executable
         run: |
           chmod +x .github/workflows/scripts/create_workspace.sh
           chmod +x .github/workflows/scripts/add_ws_admin.sh
       
-      # ✅ CORRECTED: Fixed script path
       - name: Create Workspace
         id: create-ws
         run: .github/workflows/scripts/create_workspace.sh
+        # ---------------------------------------------------------
+        # 4. UPDATE: Passing secrets and Env Vars to the script
+        # ---------------------------------------------------------
         env:
+          # Secrets for Auth
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          
+          # Script Inputs
           BRANCH_NAME: ${{ inputs.branch-name }}
           WS_PREFIX: ${{ inputs.workspace-prefix }}
-          GITHUB_OWNER: ${{ github.repository_owner }}
-          GITHUB_REPO: ${{ github.event.repository.name }}
-          GIT_BRANCH: ${{ inputs.git-branch }}
           CAPACITY_ID: ${{ inputs.capacity-id }}
           FABRIC_CONNECTION_ID: ${{ inputs.fabric-connection-id }}
+          
+          # Standard GitHub Env Vars
+          GITHUB_REPOSITORY: ${{ github.repository }} 
       
-      # ✅ CORRECTED: Fixed script path
       - name: Add Admin to Workspace
         run: .github/workflows/scripts/add_ws_admin.sh
+        # Note: If this script needs auth, it will inherit the session 
+        # created by the 'Create Workspace' script (stored in ~/.azure),
+        # or you must pass the secrets here too if it does its own login.
         env:
-          WS_ID: ${{ steps.create-ws.outputs.WS_ID }}
+          WS_ID: ${{ steps.create-ws.outputs.workspace-id }}
           WORKSPACE_ADMIN_EMAIL: ${{ inputs.workspace-admin-id }}
+          # Pass secrets if add_ws_admin.sh needs to login again:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       
       - name: Summary
         env:
-          WORKSPACE_ID: ${{ steps.create-ws.outputs.WS_ID }}
+          WORKSPACE_ID: ${{ steps.create-ws.outputs.workspace-id }}
           WORKSPACE_NAME: ${{ inputs.workspace-prefix }}-${{ inputs.branch-name }}
         run: |
           echo "### Workspace Creation Summary" >> $GITHUB_STEP_SUMMARY

@@ -71,7 +71,9 @@ jobs:
       fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
       workspace-admin-id: ${{ vars.WORKSPACE_ADMIN_ID }}
     secrets:
-      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 
   # ══════════════════════════════════════════════════════════════
   # 1. Feature → Dev: Create PR
