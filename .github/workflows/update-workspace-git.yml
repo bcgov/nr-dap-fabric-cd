@@ -111,6 +111,11 @@ jobs:
           FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
 
           echo "Connecting workspace to Git repository..."
+          echo "Connecting workspace to Git..."
+          echo "Workspace ID: ${{ inputs.workspace-id }}"
+          echo "Connection ID: ${{ inputs.fabric-connection-id }}"
+          echo "Branch: ${{ inputs.git-branch }}"
+
 
           PAYLOAD=$(cat <<EOF
           {
