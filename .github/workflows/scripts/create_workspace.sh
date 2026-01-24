@@ -98,14 +98,14 @@ echo ">> Connection ID: ${FABRIC_CONNECTION_ID}"
 # Prepare JSON Payload for GitHub
 # Note: gitProviderType is now "GitHub"
 JSON_PAYLOAD=$(jq -n \
-  --arg org "$REPO_OWNER" \
+  --arg owner "$REPO_OWNER" \
   --arg repo "$REPO_NAME" \
   --arg branch "$BRANCH" \
   --arg connId "$FABRIC_CONNECTION_ID" \
   '{
     gitProviderDetails: {
       gitProviderType: "GitHub",
-      organizationName: $org,
+      ownerName: $owner,
       repositoryName: $repo,
       branchName: $branch,
       directoryName: "/"
