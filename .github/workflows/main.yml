@@ -99,6 +99,7 @@ jobs:
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
       git-branch: dev
     secrets:
       tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -166,6 +167,7 @@ jobs:
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.PROD_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
       git-branch: main
     secrets:
       tenant-id: ${{ secrets.AZURE_TENANT_ID }}
