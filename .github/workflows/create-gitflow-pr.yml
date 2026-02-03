@@ -123,14 +123,12 @@ jobs:
           GH_TOKEN: ${{ secrets.github-token }}
         run: |
           set -euo pipefail
-          OWNER="${{ github.repository_owner }}"
           SRC="${{ inputs.source-branch }}"
           TGT="${{ inputs.target-branch }}"
 
-          HEAD_REF="${OWNER}:${SRC}"
-
+          # Try to find existing PR - use just branch name for same-repo PRs
           EXISTING_PR=$(gh pr list \
-            --head "$HEAD_REF" \
+            --head "$SRC" \
             --base "$TGT" \
             --state open \
             --json number,url \
@@ -180,24 +178,58 @@ jobs:
           GH_TOKEN: ${{ secrets.github-token }}
         run: |
           set -euo pipefail
-          OWNER="${{ github.repository_owner }}"
           SRC="${{ inputs.source-branch }}"
           TGT="${{ inputs.target-branch }}"
 
-          HEAD_REF="${OWNER}:${SRC}"
+          echo "Creating PR: $SRC -> $TGT"
 
-          echo "Creating PR: $HEAD_REF -> $TGT"
-
-          PR_URL=$(gh pr create \
-            --head "$HEAD_REF" \
+          # Attempt to create PR, handle "already exists" gracefully
+          set +e
+          PR_OUTPUT=$(gh pr create \
+            --head "$SRC" \
             --base "$TGT" \
             --title "$(cat pr_title.txt)" \
-            --body-file pr_body.txt)
+            --body-file pr_body.txt 2>&1)
+          CREATE_RC=$?
+          set -e
 
-          PR_NUMBER="${PR_URL##*/}"
-          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          # Check if PR creation failed due to already existing
+          if [[ $CREATE_RC -ne 0 ]]; then
+            if echo "$PR_OUTPUT" | grep -qi "pull request already exists"; then
+              echo "::warning::PR already exists (detected during creation). Fetching existing PR..."
+              
+              # Fetch the existing PR number
+              EXISTING_PR=$(gh pr list \
+                --head "$SRC" \
+                --base "$TGT" \
+                --state open \
+                --json number,url \
+                --jq '.[0]')
+              
+              if [[ -n "$EXISTING_PR" ]]; then
+                PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+                PR_URL=$(echo "$EXISTING_PR" | jq -r '.url')
+                echo "Found existing PR: #${PR_NUMBER}"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "skip_reason=PR already exists: #${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+                echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+                echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            
+            # If it's a different error, fail
+            echo "::error::Failed to create PR:"
+            echo "$PR_OUTPUT"
+            exit $CREATE_RC
+          fi
+
+          # Success - extract PR number from URL
+          PR_NUMBER="${PR_OUTPUT##*/}"
+          echo "pr_url=$PR_OUTPUT" >> "$GITHUB_OUTPUT"
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "Pull request created: $PR_URL (Number: $PR_NUMBER)"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Pull request created: $PR_OUTPUT (Number: $PR_NUMBER)"
 
       - name: Set PR number for subsequent steps
         id: pr-number
@@ -205,15 +237,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Use existing PR number if PR already existed
+          # Priority: use existing PR if found, or newly created PR
           if [[ "${{ steps.check-pr.outputs.skip }}" == "true" ]]; then
+            # PR existed before creation attempt
             echo "number=${{ steps.check-pr.outputs.pr_number }}" >> "$GITHUB_OUTPUT"
-          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=${{ steps.check-pr.outputs.skip_reason }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.create-pr.outputs.skip }}" == "true" ]]; then
+            # PR was found during creation attempt
             echo "number=${{ steps.create-pr.outputs.pr_number }}" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=${{ steps.create-pr.outputs.skip_reason }}" >> "$GITHUB_OUTPUT"
+          else
+            # New PR was created
+            echo "number=${{ steps.create-pr.outputs.pr_number }}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Auto-approve PR
-        if: steps.diff.outputs.skip != 'true' && steps.check-pr.outputs.skip != 'true' && inputs.auto-approve == true
+        if: steps.diff.outputs.skip != 'true' && steps.pr-number.outputs.skip != 'true' && inputs.auto-approve == true
         env:
           GH_TOKEN: ${{ secrets.github-token }}
         run: |
@@ -222,7 +264,7 @@ jobs:
           gh pr review "${{ steps.pr-number.outputs.number }}" --approve
 
       - name: Enable auto-merge
-        if: steps.diff.outputs.skip != 'true' && steps.check-pr.outputs.skip != 'true' && inputs.auto-merge == true
+        if: steps.diff.outputs.skip != 'true' && steps.pr-number.outputs.skip != 'true' && inputs.auto-merge == true
         env:
           GH_TOKEN: ${{ secrets.github-token }}
         run: |
@@ -251,7 +293,7 @@ jobs:
           echo "Auto-merge enabled with method: $MERGE_METHOD"
 
       - name: Add labels
-        if: steps.diff.outputs.skip != 'true' && steps.check-pr.outputs.skip != 'true'
+        if: steps.diff.outputs.skip != 'true' && steps.pr-number.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.github-token }}
         run: |
@@ -276,10 +318,19 @@ jobs:
             exit 0
           fi
 
-          if [[ "${{ steps.check-pr.outputs.skip }}" == "true" ]]; then
+          if [[ "${{ steps.pr-number.outputs.skip }}" == "true" ]]; then
             echo "⚠️ **Status**: PR Already Exists" >> $GITHUB_STEP_SUMMARY
-            echo "- **PR Number**: #${{ steps.check-pr.outputs.pr_number }}" >> $GITHUB_STEP_SUMMARY
-            echo "- **PR URL**: ${{ steps.check-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **PR Number**: #${{ steps.pr-number.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Reason**: ${{ steps.pr-number.outputs.skip_reason }}" >> $GITHUB_STEP_SUMMARY
+            
+            # Try to construct URL
+            if [[ -n "${{ steps.check-pr.outputs.pr_url }}" ]]; then
+              echo "- **PR URL**: ${{ steps.check-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
+            elif [[ -n "${{ steps.create-pr.outputs.pr_url }}" ]]; then
+              echo "- **PR URL**: ${{ steps.create-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **PR URL**: https://github.com/${{ github.repository }}/pull/${{ steps.pr-number.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+            fi
             exit 0
           fi
 
