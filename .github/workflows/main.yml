@@ -13,7 +13,7 @@ permissions:
 
 env:
   WS_PREFIX: feat
-  VAR_PREFIX: env_var
+  VAR_PREFIX: ENV_VARS
   APPROVER: Data-Alchemy
 
   DEV_CAPACITY_ID: ${{ vars.DEV_CAPACITY_ID }}
@@ -89,7 +89,7 @@ jobs:
           chmod +x ./.github/workflows/scripts/update_variables.sh
           ./.github/workflows/scripts/update_variables.sh \
             -p ${{ env.VAR_PREFIX }} \
-            -e dev \
+            -e DEV \
             -f ${{ env.FABRIC_VAR_FILE_PATH }} \
             -r ${{ github.repository }}
 
@@ -159,7 +159,7 @@ jobs:
           chmod +x ./.github/workflows/scripts/update_variables.sh
           ./.github/workflows/scripts/update_variables.sh \
             -p ${{ env.VAR_PREFIX }} \
-            -e test \
+            -e TEST \
             -f ${{ env.FABRIC_VAR_FILE_PATH }} \
             -r ${{ github.repository }}
 
@@ -228,7 +228,7 @@ jobs:
           chmod +x ./.github/workflows/scripts/update_variables.sh
           ./.github/workflows/scripts/update_variables.sh \
             -p ${{ env.VAR_PREFIX }} \
-            -e prod \
+            -e PROD \
             -f ${{ env.FABRIC_VAR_FILE_PATH }} \
             -r ${{ github.repository }}
 
