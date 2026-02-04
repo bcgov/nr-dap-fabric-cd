@@ -70,17 +70,6 @@ jobs:
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
           echo "Successfully obtained access token"
 
-      # ─────────────────────────────────────────────────────────────
-      # Controller: detect -> connect (if needed) -> initialize (if needed)
-      # -> optional branch update -> perform requiredAction (CommitToGit/UpdateFromGit)
-      # Explicit handling for:
-      # - status: 200 OK | 400 NotConnected | 400 NotInitialized
-      # - connect: 2xx OK | 409 AlreadyConnected OK | 404 ConnectionNotFound FAIL | 403 Privileges FAIL
-      # - init: 200 OK | 202 LRO OK | 403 Privileges FAIL
-      # - updateConnection: 2xx OK | 404 EntityNotFound WARN (non-fatal)
-      # - requiredAction: None -> no-op
-      # - updateFromGit: needs real hashes, else fail
-      # ─────────────────────────────────────────────────────────────
       - name: Sync workspace Git integration (robust)
         id: sync
         env:
@@ -102,29 +91,43 @@ jobs:
 
           # ---------- helpers ----------
           http_call() {
-            # Usage: http_call METHOD URL JSON_PAYLOAD(optional)
             local method="$1"
             local url="$2"
             local payload="${3:-}"
-            local resp http body
+            local resp
 
             if [[ -n "$payload" ]]; then
-              resp=$(curl -sS -w "\n%{http_code}" -X "$method" \
+              resp=$(curl -sS -w $'\n%{http_code}' -X "$method" \
                 "$url" \
                 -H "Authorization: Bearer $FABRIC_TOKEN" \
                 -H "Content-Type: application/json" \
                 -d "$payload")
             else
-              resp=$(curl -sS -w "\n%{http_code}" -X "$method" \
+              resp=$(curl -sS -w $'\n%{http_code}' -X "$method" \
                 "$url" \
                 -H "Authorization: Bearer $FABRIC_TOKEN" \
                 -H "Content-Type: application/json")
             fi
 
-            http=$(echo "$resp" | tail -n1)
-            body=$(echo "$resp" | sed '$d')
-            echo "$http"
-            echo "$body"
+            local http="${resp##*$'\n'}"
+            local body="${resp%$'\n'*}"
+
+            printf '%s\n' "$http"
+            printf '%s' "$body"
+          }
+
+          split_http_body() {
+            # Usage: split_http_body "$RAW" http_var body_var
+            local raw="$1"
+            local __http_var="$2"
+            local __body_var="$3"
+
+            local http body
+            http="$(printf '%s\n' "$raw" | sed -n '1p')"
+            body="$(printf '%s\n' "$raw" | sed '1d')"
+
+            printf -v "$__http_var" '%s' "$http"
+            printf -v "$__body_var" '%s' "$body"
           }
 
           fail_with_body() {
@@ -144,7 +147,6 @@ jobs:
           }
 
           poll_operation() {
-            # Poll Fabric operations until Succeeded/Failed, then return result JSON.
             local op_id="$1"
             local retry="${2:-10}"
             while true; do
@@ -170,11 +172,8 @@ jobs:
 
           # ---------- Step 1: Detect ----------
           echo "Checking git status..."
-          read -r STATUS_HTTP STATUS_BODY < <( (http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status") | awk 'NR==1{h=$0;next}{b=b $0 "\n"} END{print h; print b}' )
-
-          # The awk trick above is messy to read, so do it cleaner:
-          STATUS_HTTP=$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status" | head -n1)
-          STATUS_BODY=$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status" | tail -n +2)
+          STATUS_RAW="$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status")"
+          split_http_body "$STATUS_RAW" STATUS_HTTP STATUS_BODY
 
           CONNECTED="false"
           INITIALIZED="false"
@@ -229,8 +228,9 @@ jobs:
           }
           EOF
           )
-            CONNECT_HTTP=$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/connect" "$CONNECT_PAYLOAD" | head -n1)
-            CONNECT_BODY=$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/connect" "$CONNECT_PAYLOAD" | tail -n +2)
+
+            CONNECT_RAW="$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/connect" "$CONNECT_PAYLOAD")"
+            split_http_body "$CONNECT_RAW" CONNECT_HTTP CONNECT_BODY
 
             if [[ "$CONNECT_HTTP" =~ ^2[0-9][0-9]$ ]]; then
               echo "✓ connect: connected"
@@ -239,7 +239,6 @@ jobs:
             elif [[ "$CONNECT_HTTP" == "409" ]] && echo "$CONNECT_BODY" | jq -e '.errorCode=="WorkspaceAlreadyConnectedToGit"' >/dev/null 2>&1; then
               echo "✓ connect: already connected (409)"
               CONNECTED="true"
-              # initialization may still be false; we’ll init below
             elif [[ "$CONNECT_HTTP" == "404" ]] && echo "$CONNECT_BODY" | jq -e '.errorCode=="ConnectionNotFound"' >/dev/null 2>&1; then
               echo "✗ connect: connectionId not found/visible to this SPN"
               fail_with_body "$CONNECT_HTTP" "$CONNECT_BODY"
@@ -304,16 +303,15 @@ jobs:
           echo "remote_commit_hash=$REMOTE_HASH" >> "$GITHUB_OUTPUT"
 
           # ---------- Step 4: UpdateConnection (optional / best-effort) ----------
-          # Only attempt if Fabric expects action OR you really want branch enforcement.
-          # If requiredAction=None and updateConnection 404s in your tenant, we just skip.
           if [[ "$REQUIRED_ACTION" != "None" && -n "$REQUIRED_ACTION" ]]; then
             echo "Best-effort: updateConnection to branch '$BRANCH'..."
             UC_PAYLOAD=$(cat <<EOF
           { "branchName": "${BRANCH}" }
           EOF
           )
-            UC_HTTP=$(http_call PATCH "${FABRIC_API_URL}/workspaces/${WS}/git/updateConnection" "$UC_PAYLOAD" | head -n1)
-            UC_BODY=$(http_call PATCH "${FABRIC_API_URL}/workspaces/${WS}/git/updateConnection" "$UC_PAYLOAD" | tail -n +2)
+
+            UC_RAW="$(http_call PATCH "${FABRIC_API_URL}/workspaces/${WS}/git/updateConnection" "$UC_PAYLOAD")"
+            split_http_body "$UC_RAW" UC_HTTP UC_BODY
 
             if [[ "$UC_HTTP" =~ ^2[0-9][0-9]$ ]]; then
               echo "✓ updateConnection: ok"
@@ -336,8 +334,9 @@ jobs:
           }
           EOF
           )
-            C_HTTP=$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/commitToGit" "$COMMIT_PAYLOAD" | head -n1)
-            C_BODY=$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/commitToGit" "$COMMIT_PAYLOAD" | tail -n +2)
+
+            C_RAW="$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/commitToGit" "$COMMIT_PAYLOAD")"
+            split_http_body "$C_RAW" C_HTTP C_BODY
 
             if [[ "$C_HTTP" =~ ^2[0-9][0-9]$ ]]; then
               echo "✓ CommitToGit succeeded"
@@ -364,8 +363,9 @@ jobs:
           }
           EOF
           )
-            U_HTTP=$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/updateFromGit" "$UF_PAYLOAD" | head -n1)
-            U_BODY=$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/updateFromGit" "$UF_PAYLOAD" | tail -n +2)
+
+            U_RAW="$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/updateFromGit" "$UF_PAYLOAD")"
+            split_http_body "$U_RAW" U_HTTP U_BODY
 
             if [[ "$U_HTTP" =~ ^2[0-9][0-9]$ ]]; then
               echo "✓ UpdateFromGit accepted/succeeded"
@@ -380,8 +380,8 @@ jobs:
 
           # ---------- Step 6: Final status (best effort) ----------
           echo "Final git status (best effort)..."
-          FINAL_HTTP=$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status" | head -n1)
-          FINAL_BODY=$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status" | tail -n +2)
+          FINAL_RAW="$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status")"
+          split_http_body "$FINAL_RAW" FINAL_HTTP FINAL_BODY
 
           echo "Final status HTTP: $FINAL_HTTP"
           echo "$FINAL_BODY" | jq . || echo "$FINAL_BODY"
