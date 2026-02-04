@@ -4,18 +4,20 @@ on:
   push:
     branches:
       - "feature/**"
-      - dev
-      - test
-      - main
-  pull_request:
-    branches:
-      - dev
-      - test
-      - main
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Feature branch name'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
 
 env:
   WS_PREFIX: feat
+  VAR_PREFIX: env_var  # GitHub Variables prefix for all environments
 
   # Ensure these are using 'vars', NOT 'secrets'
   DEV_CAPACITY_ID: ${{ vars.DEV_CAPACITY_ID }}
@@ -25,17 +27,19 @@ env:
   TEST_WORKSPACE_ID: ${{ vars.TEST_WORKSPACE_ID }}
   PROD_WORKSPACE_ID: ${{ vars.PROD_WORKSPACE_ID }}
   GITHUB_REPOSITORY_NAME: ${{ github.event.repository.name }}
+  GITHUB_REPOSITORY_OWNER: ${{ github.event.repository.owner.login }}
+  FABRIC_VAR_FILE_PATH: variable_template.VariableLibrary/variables.json
 
-  # If these are secrets, REMOVE them from here and pass them directly in the jobs
+  
   FABRIC_CONNECTION_ID: ${{ vars.FABRIC_CONNECTION_ID }}
   WORKSPACE_ADMIN_ID: ${{ vars.WORKSPACE_ADMIN_ID }}
 
 jobs:
   # ══════════════════════════════════════════════════════════════
-  # 1. Validate Service Principal Permissions (New Step)
+  # 0. Validate Service Principal Permissions
   # ══════════════════════════════════════════════════════════════
   check-spn-permissions:
-    name: "1. Validate SPN Permissions"
+    name: "0. Validate SPN Permissions"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -53,138 +57,228 @@ jobs:
           ./.github/workflows/scripts/spn_evaluator.sh --output table
 
   # ══════════════════════════════════════════════════════════════
-  # 0. Create feature workspace
+  # 1. Create Feature Workspace
   # ══════════════════════════════════════════════════════════════
   create-feature-workspace:
-    name: Create Feature Workspace
-    needs: check-spn-permissions
-    if: startsWith(github.ref, 'refs/heads/feature/')
-    uses: ./.github/workflows/create-fabric-workspace.yml
-    with:
-      branch-name: ${{ github.ref_name }}
-      workspace-prefix: feat
-      capacity-id: ${{ vars.DEV_CAPACITY_ID }}
-      git-branch: ${{ github.ref_name }}
-      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
-      workspace-admin-id: ${{ vars.WORKSPACE_ADMIN_ID }}
-    secrets:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    name: "1. Create Feature Workspace"
+    needs: [check-spn-permissions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create Feature Workspace
+        uses: ./.github/workflows/create-fabric-workspace.yml
+        with:
+          branch-name: ${{ github.ref_name }}
+          workspace-prefix: feat
+          capacity-id: ${{ vars.DEV_CAPACITY_ID }}
+          git-branch: ${{ github.ref_name }}
+          fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+          workspace-admin-id: ${{ vars.WORKSPACE_ADMIN_ID }}
+        secrets:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 
   # ══════════════════════════════════════════════════════════════
-  # 1. Feature → Dev: Create PR
+  # 2. Update Variables for Dev Environment
   # ══════════════════════════════════════════════════════════════
-  feature-to-dev-pr:
-    name: "Feature → Dev PR"
-    needs: create-feature-workspace
-    if: startsWith(github.ref, 'refs/heads/feature/')
-    uses: ./.github/workflows/create-gitflow-pr.yml
-    with:
-      source-branch: ${{ github.ref_name }}
-      target-branch: dev
-      auto-approve: false
-      auto-merge: true
-      delete-source-branch: false
-    secrets:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
+  update-dev-variables:
+    name: "2. Update Dev Variables"
+    needs: [create-feature-workspace]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update variables.json for Dev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x ./.github/workflows/scripts/update_variables.sh
+          ./.github/workflows/scripts/update_variables.sh \
+            -p ${{ env.VAR_PREFIX }} \
+            -e dev \
+            -f ${{ env.FABRIC_VAR_FILE_PATH }} \
+            -r ${{ github.repository }}
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if [[ -n $(git status --porcelain) ]]; then
+            git add ${{ env.FABRIC_VAR_FILE_PATH }}
+            git commit -m "chore: update variables.json for dev environment [skip ci]"
+            git push
+          else
+            echo "No changes to commit"
+          fi
 
   # ══════════════════════════════════════════════════════════════
-  # 4. Deploy to Dev Workspace
+  # 3. Deploy to Dev Workspace (⏸️ REQUIRES MANUAL TRIGGER)
   # ══════════════════════════════════════════════════════════════
   deploy-to-dev:
-    name: Deploy to Dev
-    needs: check-spn-permissions
-    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
-    uses: ./.github/workflows/update-workspace-git.yml
-    with:
-      workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
-      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
-      git-branch: dev
-    secrets:
-      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-      client-id: ${{ secrets.AZURE_CLIENT_ID }}
-      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+    name: "3. Deploy to Dev (Manual Approval Required)"
+    needs: [update-dev-variables]
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: https://app.fabric.microsoft.com/groups/${{ vars.DEV_WORKSPACE_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Login to Azure
+        run: |
+          az login --service-principal \
+            --username ${{ secrets.AZURE_CLIENT_ID }} \
+            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Deploy to Dev Workspace
+        run: |
+          echo "Deploying to Dev Workspace: ${{ vars.DEV_WORKSPACE_ID }}"
+          # Add your deployment logic here
+          # This would call your update-workspace-git logic
 
   # ══════════════════════════════════════════════════════════════
-  # 2. Dev → Test: Create PR
+  # 4. Update Variables for Test Environment
   # ══════════════════════════════════════════════════════════════
-  dev-to-test-pr:
-    name: "Dev → Test PR"
-    needs: deploy-to-dev
-    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
-    uses: ./.github/workflows/create-gitflow-pr.yml
-    with:
-      source-branch: dev
-      target-branch: test
-      auto-approve: false
-      auto-merge: true
-      delete-source-branch: false
-    secrets:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
+  update-test-variables:
+    name: "4. Update Test Variables"
+    needs: [deploy-to-dev]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update variables.json for Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x ./.github/workflows/scripts/update_variables.sh
+          ./.github/workflows/scripts/update_variables.sh \
+            -p ${{ env.VAR_PREFIX }} \
+            -e test \
+            -f ${{ env.FABRIC_VAR_FILE_PATH }} \
+            -r ${{ github.repository }}
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if [[ -n $(git status --porcelain) ]]; then
+            git add ${{ env.FABRIC_VAR_FILE_PATH }}
+            git commit -m "chore: update variables.json for test environment [skip ci]"
+            git push
+          else
+            echo "No changes to commit"
+          fi
 
   # ══════════════════════════════════════════════════════════════
-  # 5. Deploy to Test Workspace
+  # 5. Deploy to Test Workspace (⏸️ REQUIRES APPROVAL)
   # ══════════════════════════════════════════════════════════════
   deploy-to-test:
-    name: Deploy to Test
-    needs: check-spn-permissions
-    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
-    uses: ./.github/workflows/update-workspace-git.yml
-    with:
-      workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
-      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
-      git-branch: test
-    secrets:
-      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-      client-id: ${{ secrets.AZURE_CLIENT_ID }}
-      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+    name: "5. Deploy to Test (Approval Required)"
+    needs: [update-test-variables]
+    runs-on: ubuntu-latest
+    environment:
+      name: test
+      url: https://app.fabric.microsoft.com/groups/${{ vars.TEST_WORKSPACE_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Login to Azure
+        run: |
+          az login --service-principal \
+            --username ${{ secrets.AZURE_CLIENT_ID }} \
+            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Deploy to Test Workspace
+        run: |
+          echo "Deploying to Test Workspace: ${{ vars.TEST_WORKSPACE_ID }}"
+          # Add your deployment logic here
 
   # ══════════════════════════════════════════════════════════════
-  # 3. Test → Main: Create PR
+  # 6. Update Variables for Production Environment
   # ══════════════════════════════════════════════════════════════
-  test-to-main-pr:
-    name: "Test → Main PR"
-    needs: deploy-to-test
-    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
-    uses: ./.github/workflows/create-gitflow-pr.yml
-    with:
-      source-branch: test
-      target-branch: main
-      auto-approve: false
-      auto-merge: false
-      delete-source-branch: false
-    secrets:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
+  update-prod-variables:
+    name: "6. Update Prod Variables"
+    needs: [deploy-to-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update variables.json for Production
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x ./.github/workflows/scripts/update_variables.sh
+          ./.github/workflows/scripts/update_variables.sh \
+            -p ${{ env.VAR_PREFIX }} \
+            -e prod \
+            -f ${{ env.FABRIC_VAR_FILE_PATH }} \
+            -r ${{ github.repository }}
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if [[ -n $(git status --porcelain) ]]; then
+            git add ${{ env.FABRIC_VAR_FILE_PATH }}
+            git commit -m "chore: update variables.json for production environment [skip ci]"
+            git push
+          else
+            echo "No changes to commit"
+          fi
 
   # ══════════════════════════════════════════════════════════════
-  # 6. Deploy to Production Workspace
+  # 7. Deploy to Production Workspace (⏸️ REQUIRES APPROVAL)
   # ══════════════════════════════════════════════════════════════
   deploy-to-prod:
-    name: Deploy to Production
-    needs: check-spn-permissions
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    uses: ./.github/workflows/update-workspace-git.yml
-    with:
-      workspace-id: ${{ vars.PROD_WORKSPACE_ID }}
-      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
-      git-branch: main
-    secrets:
-      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-      client-id: ${{ secrets.AZURE_CLIENT_ID }}
-      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+    name: "7. Deploy to Production (Approval Required)"
+    needs: [update-prod-variables]
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://app.fabric.microsoft.com/groups/${{ vars.PROD_WORKSPACE_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      
-  # # ══════════════════════════════════════════════════════════════
-  # # 7. Delete Feature Workspace
-  # # ══════════════════════════════════════════════════════════════
-  # delete-feature-workspace:
-  #   name: Delete Feature Workspace
-  #   needs: [test-to-main-pr]
-  #   if: startsWith(github.ref, 'refs/heads/feature/')
-  #   uses: ./.github/workflows/delete-workspace.yml
-  #   with:
-  #     branch-name: ${{ github.ref_name }}
-  #     workspace-prefix: feat
-  #   secrets:
-  #     AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Login to Azure
+        run: |
+          az login --service-principal \
+            --username ${{ secrets.AZURE_CLIENT_ID }} \
+            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Deploy to Production Workspace
+        run: |
+          echo "Deploying to Production Workspace: ${{ vars.PROD_WORKSPACE_ID }}"
+          # Add your deployment logic here
