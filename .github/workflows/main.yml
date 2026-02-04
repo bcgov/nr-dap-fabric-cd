@@ -5,21 +5,17 @@ on:
     branches:
       - "feature/**"
   workflow_dispatch:
-    inputs:
-      branch:
-        description: 'Feature branch name'
-        required: true
-        type: string
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 env:
   WS_PREFIX: feat
-  VAR_PREFIX: env_var  # GitHub Variables prefix for all environments
+  VAR_PREFIX: env_var
+  APPROVER: Data-Alchemy
 
-  # Ensure these are using 'vars', NOT 'secrets'
   DEV_CAPACITY_ID: ${{ vars.DEV_CAPACITY_ID }}
   TEST_CAPACITY_ID: ${{ vars.TEST_CAPACITY_ID }}
   PROD_CAPACITY_ID: ${{ vars.PROD_CAPACITY_ID }}
@@ -29,8 +25,6 @@ env:
   GITHUB_REPOSITORY_NAME: ${{ github.event.repository.name }}
   GITHUB_REPOSITORY_OWNER: ${{ github.event.repository.owner.login }}
   FABRIC_VAR_FILE_PATH: variable_template.VariableLibrary/variables.json
-
-  
   FABRIC_CONNECTION_ID: ${{ vars.FABRIC_CONNECTION_ID }}
   WORKSPACE_ADMIN_ID: ${{ vars.WORKSPACE_ADMIN_ID }}
 
@@ -62,24 +56,18 @@ jobs:
   create-feature-workspace:
     name: "1. Create Feature Workspace"
     needs: [check-spn-permissions]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create Feature Workspace
-        uses: ./.github/workflows/create-fabric-workspace.yml
-        with:
-          branch-name: ${{ github.ref_name }}
-          workspace-prefix: feat
-          capacity-id: ${{ vars.DEV_CAPACITY_ID }}
-          git-branch: ${{ github.ref_name }}
-          fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
-          workspace-admin-id: ${{ vars.WORKSPACE_ADMIN_ID }}
-        secrets:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    uses: ./.github/workflows/create-fabric-workspace.yml
+    with:
+      branch-name: ${{ github.ref_name }}
+      workspace-prefix: feat
+      capacity-id: ${{ vars.DEV_CAPACITY_ID }}
+      git-branch: ${{ github.ref_name }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      workspace-admin-id: ${{ vars.WORKSPACE_ADMIN_ID }}
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 
   # ══════════════════════════════════════════════════════════════
   # 2. Update Variables for Dev Environment
@@ -119,41 +107,42 @@ jobs:
           fi
 
   # ══════════════════════════════════════════════════════════════
-  # 3. Deploy to Dev Workspace (⏸️ REQUIRES MANUAL TRIGGER)
+  # 3. Wait for Dev Approval
+  # ══════════════════════════════════════════════════════════════
+  # no approval step for dev deploys 
+  # wait-for-dev-approval:
+  #   name: "3. Wait for Dev Approval"
+  #   needs: [update-dev-variables]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: trstringer/manual-approval@v1
+  #       with:
+  #         secret: ${{ github.TOKEN }}
+  #         approvers: ${{ env.APPROVER }}
+  #         minimum-approvals: 1
+  #         issue-title: "Deploy to Dev Environment"
+  #         issue-body: "Please approve deployment to Dev workspace"
+
+  # ══════════════════════════════════════════════════════════════
+  # 4. Deploy to Dev Workspace
   # ══════════════════════════════════════════════════════════════
   deploy-to-dev:
-    name: "3. Deploy to Dev (Manual Approval Required)"
-    needs: [update-dev-variables]
-    runs-on: ubuntu-latest
-    environment:
-      name: dev
-      url: https://app.fabric.microsoft.com/groups/${{ vars.DEV_WORKSPACE_ID }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Azure CLI
-        run: |
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-
-      - name: Login to Azure
-        run: |
-          az login --service-principal \
-            --username ${{ secrets.AZURE_CLIENT_ID }} \
-            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
-            --tenant ${{ secrets.AZURE_TENANT_ID }}
-
-      - name: Deploy to Dev Workspace
-        run: |
-          echo "Deploying to Dev Workspace: ${{ vars.DEV_WORKSPACE_ID }}"
-          # Add your deployment logic here
-          # This would call your update-workspace-git logic
+    name: "4. Deploy to Dev"
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: ${{ github.ref_name }}
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
-  # 4. Update Variables for Test Environment
+  # 5. Update Variables for Test Environment
   # ══════════════════════════════════════════════════════════════
   update-test-variables:
-    name: "4. Update Test Variables"
+    name: "5. Update Test Variables"
     needs: [deploy-to-dev]
     runs-on: ubuntu-latest
     steps:
@@ -187,40 +176,42 @@ jobs:
           fi
 
   # ══════════════════════════════════════════════════════════════
-  # 5. Deploy to Test Workspace (⏸️ REQUIRES APPROVAL)
+  # 6. Wait for Test Approval
   # ══════════════════════════════════════════════════════════════
-  deploy-to-test:
-    name: "5. Deploy to Test (Approval Required)"
+  wait-for-test-approval:
+    name: "6. Wait for Test Approval"
     needs: [update-test-variables]
     runs-on: ubuntu-latest
-    environment:
-      name: test
-      url: https://app.fabric.microsoft.com/groups/${{ vars.TEST_WORKSPACE_ID }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Azure CLI
-        run: |
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-
-      - name: Login to Azure
-        run: |
-          az login --service-principal \
-            --username ${{ secrets.AZURE_CLIENT_ID }} \
-            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
-            --tenant ${{ secrets.AZURE_TENANT_ID }}
-
-      - name: Deploy to Test Workspace
-        run: |
-          echo "Deploying to Test Workspace: ${{ vars.TEST_WORKSPACE_ID }}"
-          # Add your deployment logic here
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ env.APPROVER }}
+          minimum-approvals: 1
+          issue-title: "Deploy to Test Environment"
+          issue-body: "Please approve deployment to Test workspace"
 
   # ══════════════════════════════════════════════════════════════
-  # 6. Update Variables for Production Environment
+  # 7. Deploy to Test Workspace
+  # ══════════════════════════════════════════════════════════════
+  deploy-to-test:
+    name: "7. Deploy to Test"
+    needs: [wait-for-test-approval]
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: ${{ github.ref_name }}
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
+  # 8. Update Variables for Production Environment
   # ══════════════════════════════════════════════════════════════
   update-prod-variables:
-    name: "6. Update Prod Variables"
+    name: "8. Update Prod Variables"
     needs: [deploy-to-test]
     runs-on: ubuntu-latest
     steps:
@@ -254,31 +245,33 @@ jobs:
           fi
 
   # ══════════════════════════════════════════════════════════════
-  # 7. Deploy to Production Workspace (⏸️ REQUIRES APPROVAL)
+  # 9. Wait for Production Approval
   # ══════════════════════════════════════════════════════════════
-  deploy-to-prod:
-    name: "7. Deploy to Production (Approval Required)"
+  wait-for-prod-approval:
+    name: "9. Wait for Production Approval"
     needs: [update-prod-variables]
     runs-on: ubuntu-latest
-    environment:
-      name: prod
-      url: https://app.fabric.microsoft.com/groups/${{ vars.PROD_WORKSPACE_ID }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ env.APPROVER }}
+          minimum-approvals: 2
+          issue-title: "Deploy to Production Environment"
+          issue-body: "Please approve deployment to Production workspace"
 
-      - name: Install Azure CLI
-        run: |
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-
-      - name: Login to Azure
-        run: |
-          az login --service-principal \
-            --username ${{ secrets.AZURE_CLIENT_ID }} \
-            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
-            --tenant ${{ secrets.AZURE_TENANT_ID }}
-
-      - name: Deploy to Production Workspace
-        run: |
-          echo "Deploying to Production Workspace: ${{ vars.PROD_WORKSPACE_ID }}"
-          # Add your deployment logic here
+  # ══════════════════════════════════════════════════════════════
+  # 10. Deploy to Production Workspace
+  # ══════════════════════════════════════════════════════════════
+  deploy-to-prod:
+    name: "10. Deploy to Production"
+    needs: [wait-for-prod-approval]
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.PROD_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: ${{ github.ref_name }}
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
