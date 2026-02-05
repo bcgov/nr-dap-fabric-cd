@@ -116,7 +116,7 @@ process_variables() {
             local clean_name=$(strip_prefix_from_name "$name")
             local escaped_value=$(escape_json_value "$value")
             json_vars=$(add_variable_to_json "$json_vars" "$clean_name" "$escaped_value")
-            echo "  Added: $clean_name" >&2
+            echo "  Processing: $clean_name" >&2
         fi
     done <<< "$filtered_vars"
     
@@ -130,6 +130,40 @@ create_fabric_json() {
             "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/variableLibrary/definition/variables/1.0.0/schema.json",
             "variables": $variables
         }'
+}
+
+read_existing_variables() {
+    if [[ -f "$FILE_PATH" ]]; then
+        echo "Reading existing variables from file..." >&2
+        jq -r '.variables // []' "$FILE_PATH" 2>/dev/null || echo "[]"
+    else
+        echo "[]"
+    fi
+}
+
+merge_variables() {
+    local existing_vars=$1
+    local new_vars=$2
+    
+    # Create a combined array that updates existing variables and adds new ones
+    jq -n --argjson existing "$existing_vars" --argjson new "$new_vars" '
+        # Start with existing variables
+        $existing as $base |
+        # For each new variable, create a map for quick lookup
+        ($new | map({(.name): .})) as $new_map |
+        # Update existing variables or keep as-is
+        ($base | map(
+            if ($new_map[.name]) then
+                $new_map[.name]
+            else
+                .
+            end
+        )) as $updated |
+        # Find new variables that weren'\''t in existing
+        ($new | map(select(.name as $n | ($base | map(.name) | index($n)) == null))) as $additions |
+        # Combine updated and additions
+        $updated + $additions
+    '
 }
 
 ensure_directory_exists() {
@@ -147,9 +181,18 @@ write_to_file() {
 
 display_summary() {
     local variable_count=$1
+    local updated_count=$2
+    local added_count=$3
+    local unchanged_count=$4
+    
     echo "" >&2
     echo "✓ Successfully wrote variables to: $FILE_PATH" >&2
     echo "  Total variables: $variable_count" >&2
+    if [[ $updated_count -gt 0 ]] || [[ $added_count -gt 0 ]] || [[ $unchanged_count -gt 0 ]]; then
+        echo "  Updated: $updated_count" >&2
+        echo "  Added: $added_count" >&2
+        echo "  Unchanged: $unchanged_count" >&2
+    fi
 }
 
 main() {
@@ -165,17 +208,49 @@ main() {
     
     if [[ -z "$filtered_vars" ]]; then
         echo "Warning: No variables found with prefix '${PREFIX}_${ENVIRONMENT}_'" >&2
-        echo "Creating empty variables.json file..." >&2
-        filtered_vars=""
+        if [[ ! -f "$FILE_PATH" ]]; then
+            echo "Creating empty variables.json file..." >&2
+            local final_json=$(create_fabric_json "[]")
+            ensure_directory_exists
+            write_to_file "$final_json"
+            display_summary 0 0 0 0
+        else
+            echo "Keeping existing file unchanged." >&2
+            local existing_count=$(jq '.variables | length' "$FILE_PATH")
+            echo "" >&2
+            echo "✓ File unchanged: $FILE_PATH" >&2
+            echo "  Total variables: $existing_count" >&2
+        fi
+        return 0
     fi
     
-    local json_vars=$(process_variables "$filtered_vars")
-    local final_json=$(create_fabric_json "$json_vars")
-    local variable_count=$(echo "$json_vars" | jq 'length')
+    # Read existing variables if file exists
+    local existing_vars=$(read_existing_variables)
+    
+    # Process new variables from GitHub
+    local new_vars=$(process_variables "$filtered_vars")
+    
+    # Merge existing and new variables
+    echo "Merging variables..." >&2
+    local merged_vars=$(merge_variables "$existing_vars" "$new_vars")
+    
+    # Calculate statistics
+    local existing_count=$(echo "$existing_vars" | jq 'length')
+    local new_count=$(echo "$new_vars" | jq 'length')
+    local total_count=$(echo "$merged_vars" | jq 'length')
+    local added_count=$((total_count - existing_count))
+    local updated_count=$((new_count - added_count))
+    local unchanged_count=$((existing_count - updated_count))
+    
+    # Ensure counts don't go negative (in case of edge cases)
+    [[ $added_count -lt 0 ]] && added_count=0
+    [[ $unchanged_count -lt 0 ]] && unchanged_count=0
+    
+    local final_json=$(create_fabric_json "$merged_vars")
     
     ensure_directory_exists
     write_to_file "$final_json"
-    display_summary "$variable_count"
+    display_summary "$total_count" "$updated_count" "$added_count" "$unchanged_count"
 }
 
 main "$@"
