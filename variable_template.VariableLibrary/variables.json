@@ -1,4 +1,35 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/variableLibrary/definition/variables/1.0.0/schema.json",
-  "variables": []
+  "variables": [
+    {
+      "name": "CAPACITY_ID",
+      "note": "",
+      "type": "String",
+      "value": "456"
+    },
+    {
+      "name": "LAKEHOUSE_ID",
+      "note": "",
+      "type": "String",
+      "value": "x"
+    },
+    {
+      "name": "ORA_CONNECTION_ID",
+      "note": "",
+      "type": "String",
+      "value": "x"
+    },
+    {
+      "name": "PG_CONNECTION_ID",
+      "note": "",
+      "type": "String",
+      "value": "x"
+    },
+    {
+      "name": "S3_CONNECTION_ID",
+      "note": "",
+      "type": "String",
+      "value": "x"
+    }
+  ]
 }
