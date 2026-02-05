@@ -1,0 +1,399 @@
+# .github/workflows/update-workspace-git.yml
+name: Update Workspace Git Integration
+
+on:
+  workflow_call:
+    inputs:
+      workspace-id:
+        required: true
+        type: string
+        description: "Workspace ID to update"
+      git-branch:
+        required: true
+        type: string
+        description: "Git branch to pull from"
+      fabric-connection-id:
+        required: true
+        type: string
+        description: "Fabric GitHub connection ID (ConfiguredConnection)"
+    secrets:
+      tenant-id:
+        required: true
+      client-id:
+        required: true
+      client-secret:
+        required: true
+
+jobs:
+  update-workspace:
+    name: Update Workspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Get Fabric API Token
+        id: get-token
+        env:
+          TENANT_ID: ${{ secrets.tenant-id }}
+          CLIENT_ID: ${{ secrets.client-id }}
+          CLIENT_SECRET: ${{ secrets.client-secret }}
+        run: |
+          set -euo pipefail
+
+          : "${TENANT_ID:?TENANT_ID is empty}"
+          : "${CLIENT_ID:?CLIENT_ID is empty}"
+          : "${CLIENT_SECRET:?CLIENT_SECRET is empty}"
+
+          TOKEN_URL="https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token"
+          RESPONSE=$(curl -sS -X POST "$TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "client_id=${CLIENT_ID}" \
+            --data-urlencode "client_secret=${CLIENT_SECRET}" \
+            --data-urlencode "scope=https://api.fabric.microsoft.com/.default" \
+            --data-urlencode "grant_type=client_credentials")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
+          if [[ -z "$TOKEN" ]]; then
+            echo "Error: Failed to get access token"
+            echo "$RESPONSE" | jq '{error, error_description, trace_id, correlation_id}'
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "Successfully obtained access token"
+
+      - name: Sync workspace Git integration (robust)
+        id: sync
+        env:
+          FABRIC_TOKEN: ${{ steps.get-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          FABRIC_API_URL="https://api.fabric.microsoft.com/v1"
+          WS="${{ inputs.workspace-id }}"
+          BRANCH="${{ inputs.git-branch }}"
+          CONN_ID="${{ inputs.fabric-connection-id }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+
+          echo "Workspace ID: $WS"
+          echo "Branch: $BRANCH"
+          echo "Connection ID: $CONN_ID"
+          echo "Repo: ${OWNER}/${REPO}"
+
+          # ---------- helpers ----------
+          http_call() {
+            local method="$1"
+            local url="$2"
+            local payload="${3:-}"
+            local resp
+
+            if [[ -n "$payload" ]]; then
+              resp=$(curl -sS -w $'\n%{http_code}' -X "$method" \
+                "$url" \
+                -H "Authorization: Bearer $FABRIC_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$payload")
+            else
+              resp=$(curl -sS -w $'\n%{http_code}' -X "$method" \
+                "$url" \
+                -H "Authorization: Bearer $FABRIC_TOKEN" \
+                -H "Content-Type: application/json")
+            fi
+
+            local http="${resp##*$'\n'}"
+            local body="${resp%$'\n'*}"
+
+            printf '%s\n' "$http"
+            printf '%s' "$body"
+          }
+
+          split_http_body() {
+            # Usage: split_http_body "$RAW" http_var body_var
+            local raw="$1"
+            local __http_var="$2"
+            local __body_var="$3"
+
+            local http body
+            http="$(printf '%s\n' "$raw" | sed -n '1p')"
+            body="$(printf '%s\n' "$raw" | sed '1d')"
+
+            printf -v "$__http_var" '%s' "$http"
+            printf -v "$__body_var" '%s' "$body"
+          }
+
+          fail_with_body() {
+            local http="$1"
+            local body="$2"
+            echo "✗ HTTP $http"
+            echo "$body" | jq . || echo "$body"
+            exit 1
+          }
+
+          warn_with_body() {
+            local msg="$1"
+            local http="$2"
+            local body="$3"
+            echo "⚠ $msg (HTTP $http)"
+            echo "$body" | jq . || echo "$body"
+          }
+
+          poll_operation() {
+            local op_id="$1"
+            local retry="${2:-10}"
+            while true; do
+              local op_status op_json
+              op_json=$(curl -sS -X GET "${FABRIC_API_URL}/operations/${op_id}" \
+                -H "Authorization: Bearer $FABRIC_TOKEN" \
+                -H "Content-Type: application/json")
+              op_status=$(echo "$op_json" | jq -r '.status // empty')
+              echo "LRO status: $op_status"
+              if [[ "$op_status" == "Succeeded" ]]; then
+                break
+              elif [[ "$op_status" == "Failed" ]]; then
+                echo "$op_json" | jq .
+                exit 1
+              fi
+              sleep "$retry"
+            done
+
+            curl -sS -X GET "${FABRIC_API_URL}/operations/${op_id}/result" \
+              -H "Authorization: Bearer $FABRIC_TOKEN" \
+              -H "Content-Type: application/json"
+          }
+
+          # ---------- Step 1: Detect ----------
+          echo "Checking git status..."
+          STATUS_RAW="$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status")"
+          split_http_body "$STATUS_RAW" STATUS_HTTP STATUS_BODY
+
+          CONNECTED="false"
+          INITIALIZED="false"
+          STATUS_ERROR=""
+
+          if [[ "$STATUS_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+            echo "✓ status: connected + initialized"
+            CONNECTED="true"
+            INITIALIZED="true"
+          elif [[ "$STATUS_HTTP" == "400" ]]; then
+            STATUS_ERROR=$(echo "$STATUS_BODY" | jq -r '.errorCode // empty')
+            if [[ "$STATUS_ERROR" == "WorkspaceNotConnectedToGit" ]]; then
+              echo "ℹ status: not connected"
+              CONNECTED="false"
+              INITIALIZED="false"
+            elif [[ "$STATUS_ERROR" == "WorkspaceGitConnectionNotInitialized" ]]; then
+              echo "ℹ status: connected, not initialized"
+              CONNECTED="true"
+              INITIALIZED="false"
+            else
+              echo "✗ status: unexpected 400"
+              fail_with_body "$STATUS_HTTP" "$STATUS_BODY"
+            fi
+          elif [[ "$STATUS_HTTP" == "403" ]]; then
+            echo "✗ status: insufficient privileges"
+            fail_with_body "$STATUS_HTTP" "$STATUS_BODY"
+          else
+            echo "✗ status: unexpected response"
+            fail_with_body "$STATUS_HTTP" "$STATUS_BODY"
+          fi
+
+          echo "connected=$CONNECTED" >> "$GITHUB_OUTPUT"
+          echo "initialized_before=$INITIALIZED" >> "$GITHUB_OUTPUT"
+          echo "status_error_code=$STATUS_ERROR" >> "$GITHUB_OUTPUT"
+
+          # ---------- Step 2: Connect (only if not connected) ----------
+          if [[ "$CONNECTED" != "true" ]]; then
+            echo "Connecting workspace to Git..."
+            CONNECT_PAYLOAD=$(cat <<EOF
+          {
+            "gitProviderDetails": {
+              "gitProviderType": "GitHub",
+              "ownerName": "${OWNER}",
+              "repositoryName": "${REPO}",
+              "branchName": "${BRANCH}",
+              "directoryName": "/"
+            },
+            "myGitCredentials": {
+              "source": "ConfiguredConnection",
+              "connectionId": "${CONN_ID}"
+            }
+          }
+          EOF
+          )
+
+            CONNECT_RAW="$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/connect" "$CONNECT_PAYLOAD")"
+            split_http_body "$CONNECT_RAW" CONNECT_HTTP CONNECT_BODY
+
+            if [[ "$CONNECT_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+              echo "✓ connect: connected"
+              CONNECTED="true"
+              INITIALIZED="false"
+            elif [[ "$CONNECT_HTTP" == "409" ]] && echo "$CONNECT_BODY" | jq -e '.errorCode=="WorkspaceAlreadyConnectedToGit"' >/dev/null 2>&1; then
+              echo "✓ connect: already connected (409)"
+              CONNECTED="true"
+            elif [[ "$CONNECT_HTTP" == "404" ]] && echo "$CONNECT_BODY" | jq -e '.errorCode=="ConnectionNotFound"' >/dev/null 2>&1; then
+              echo "✗ connect: connectionId not found/visible to this SPN"
+              fail_with_body "$CONNECT_HTTP" "$CONNECT_BODY"
+            elif [[ "$CONNECT_HTTP" == "403" ]] && echo "$CONNECT_BODY" | jq -e '.errorCode=="InsufficientPrivileges"' >/dev/null 2>&1; then
+              echo "✗ connect: insufficient privileges"
+              fail_with_body "$CONNECT_HTTP" "$CONNECT_BODY"
+            else
+              echo "✗ connect: failed"
+              fail_with_body "$CONNECT_HTTP" "$CONNECT_BODY"
+            fi
+          fi
+
+          echo "connected_after_connect=$CONNECTED" >> "$GITHUB_OUTPUT"
+
+          # ---------- Step 3: Initialize (if not initialized) ----------
+          REQUIRED_ACTION=""
+          REMOTE_HASH=""
+          WORKSPACE_HEAD=""
+
+          if [[ "$INITIALIZED" != "true" ]]; then
+            echo "Initializing git connection..."
+            HEADERS_FILE="$(mktemp)"
+            BODY_FILE="$(mktemp)"
+
+            INIT_HTTP=$(curl -sS -D "$HEADERS_FILE" -o "$BODY_FILE" -w "%{http_code}" -X POST \
+              "${FABRIC_API_URL}/workspaces/${WS}/git/initializeConnection" \
+              -H "Authorization: Bearer $FABRIC_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{}")
+
+            if [[ "$INIT_HTTP" == "200" ]]; then
+              INIT_RESULT="$(cat "$BODY_FILE")"
+              echo "✓ init: done (200)"
+            elif [[ "$INIT_HTTP" == "202" ]]; then
+              OP_ID=$(grep -i '^x-ms-operation-id:' "$HEADERS_FILE" | awk '{print $2}' | tr -d '\r')
+              RETRY=$(grep -i '^retry-after:' "$HEADERS_FILE" | awk '{print $2}' | tr -d '\r')
+              [[ -z "$RETRY" ]] && RETRY=10
+              echo "⏳ init: running (op=$OP_ID), polling every ${RETRY}s..."
+              INIT_RESULT=$(poll_operation "$OP_ID" "$RETRY")
+              echo "✓ init: done (202->Succeeded)"
+            else
+              echo "✗ init: failed"
+              cat "$BODY_FILE" | jq . || cat "$BODY_FILE"
+              exit 1
+            fi
+
+            echo "$INIT_RESULT" | jq . || true
+
+            REQUIRED_ACTION=$(echo "$INIT_RESULT" | jq -r '.requiredAction // empty')
+            WORKSPACE_HEAD=$(echo "$INIT_RESULT" | jq -r '.workspaceHead // empty')
+            REMOTE_HASH=$(echo "$INIT_RESULT" | jq -r '.remoteCommitHash // empty')
+
+            INITIALIZED="true"
+          else
+            echo "✓ init: already initialized (from status)"
+            REQUIRED_ACTION="None"
+          fi
+
+          echo "initialized_final=$INITIALIZED" >> "$GITHUB_OUTPUT"
+          echo "required_action=$REQUIRED_ACTION" >> "$GITHUB_OUTPUT"
+          echo "workspace_head=$WORKSPACE_HEAD" >> "$GITHUB_OUTPUT"
+          echo "remote_commit_hash=$REMOTE_HASH" >> "$GITHUB_OUTPUT"
+
+          # ---------- Step 4: UpdateConnection (optional / best-effort) ----------
+          if [[ "$REQUIRED_ACTION" != "None" && -n "$REQUIRED_ACTION" ]]; then
+            echo "Best-effort: updateConnection to branch '$BRANCH'..."
+            UC_PAYLOAD=$(cat <<EOF
+          { "branchName": "${BRANCH}" }
+          EOF
+          )
+
+            UC_RAW="$(http_call PATCH "${FABRIC_API_URL}/workspaces/${WS}/git/updateConnection" "$UC_PAYLOAD")"
+            split_http_body "$UC_RAW" UC_HTTP UC_BODY
+
+            if [[ "$UC_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+              echo "✓ updateConnection: ok"
+            elif [[ "$UC_HTTP" == "404" ]] && echo "$UC_BODY" | jq -e '.errorCode=="EntityNotFound"' >/dev/null 2>&1; then
+              warn_with_body "updateConnection not available for this workspace connection (non-fatal)" "$UC_HTTP" "$UC_BODY"
+            else
+              warn_with_body "updateConnection failed (non-fatal)" "$UC_HTTP" "$UC_BODY"
+            fi
+          else
+            echo "Skipping updateConnection (requiredAction=None)"
+          fi
+
+          # ---------- Step 5: Perform required action ----------
+          if [[ "$REQUIRED_ACTION" == "CommitToGit" ]]; then
+            echo "Performing CommitToGit..."
+            COMMIT_PAYLOAD=$(cat <<EOF
+          {
+            "mode": "All",
+            "comment": "Automated commit from workspace - ${{ github.sha }}"
+          }
+          EOF
+          )
+
+            C_RAW="$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/commitToGit" "$COMMIT_PAYLOAD")"
+            split_http_body "$C_RAW" C_HTTP C_BODY
+
+            if [[ "$C_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+              echo "✓ CommitToGit succeeded"
+            elif [[ "$C_HTTP" == "400" ]] && echo "$C_BODY" | jq -e '.errorCode=="WorkspaceGitConnectionNotInitialized"' >/dev/null 2>&1; then
+              echo "✗ CommitToGit: NotInitialized (should not happen after init) -> failing"
+              fail_with_body "$C_HTTP" "$C_BODY"
+            else
+              echo "✗ CommitToGit failed"
+              fail_with_body "$C_HTTP" "$C_BODY"
+            fi
+
+          elif [[ "$REQUIRED_ACTION" == "UpdateFromGit" ]]; then
+            echo "Performing UpdateFromGit..."
+            if [[ -z "$REMOTE_HASH" || -z "$WORKSPACE_HEAD" || "$REMOTE_HASH" == "null" || "$WORKSPACE_HEAD" == "null" ]]; then
+              echo "✗ UpdateFromGit requires remoteCommitHash + workspaceHead, but missing."
+              echo "remoteCommitHash='$REMOTE_HASH' workspaceHead='$WORKSPACE_HEAD'"
+              exit 1
+            fi
+
+            UF_PAYLOAD=$(cat <<EOF
+          {
+            "remoteCommitHash": "${REMOTE_HASH}",
+            "workspaceHead": "${WORKSPACE_HEAD}"
+          }
+          EOF
+          )
+
+            U_RAW="$(http_call POST "${FABRIC_API_URL}/workspaces/${WS}/git/updateFromGit" "$UF_PAYLOAD")"
+            split_http_body "$U_RAW" U_HTTP U_BODY
+
+            if [[ "$U_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+              echo "✓ UpdateFromGit accepted/succeeded"
+            else
+              echo "✗ UpdateFromGit failed"
+              fail_with_body "$U_HTTP" "$U_BODY"
+            fi
+
+          else
+            echo "No required action (requiredAction='${REQUIRED_ACTION:-None}'). No-op."
+          fi
+
+          # ---------- Step 6: Final status (best effort) ----------
+          echo "Final git status (best effort)..."
+          FINAL_RAW="$(http_call GET "${FABRIC_API_URL}/workspaces/${WS}/git/status")"
+          split_http_body "$FINAL_RAW" FINAL_HTTP FINAL_BODY
+
+          echo "Final status HTTP: $FINAL_HTTP"
+          echo "$FINAL_BODY" | jq . || echo "$FINAL_BODY"
+
+      - name: Summary
+        run: |
+          echo "### Workspace Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workspace ID**: ${{ inputs.workspace-id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git Branch**: ${{ inputs.git-branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Connection ID**: ${{ inputs.fabric-connection-id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Connected (final)**: ${{ steps.sync.outputs.connected_after_connect }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Initialized (final)**: ${{ steps.sync.outputs.initialized_final }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **requiredAction**: ${{ steps.sync.outputs.required_action }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **workspaceHead**: ${{ steps.sync.outputs.workspace_head }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **remoteCommitHash**: ${{ steps.sync.outputs.remote_commit_hash }}" >> $GITHUB_STEP_SUMMARY

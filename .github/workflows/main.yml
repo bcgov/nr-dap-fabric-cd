@@ -1,0 +1,345 @@
+name: Fabric Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  pull_request:
+    branches:
+      - "main"
+    types: [closed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  WS_PREFIX: feat
+  VAR_PREFIX: ENV_VAR
+  APPROVER: Data-Alchemy
+
+  DEV_CAPACITY_ID: ${{ vars.DEV_CAPACITY_ID }}
+  TEST_CAPACITY_ID: ${{ vars.TEST_CAPACITY_ID }}
+  PROD_CAPACITY_ID: ${{ vars.PROD_CAPACITY_ID }}
+
+  DEV_WORKSPACE_ID: ${{ vars.DEV_WORKSPACE_ID }}
+  TEST_WORKSPACE_ID: ${{ vars.TEST_WORKSPACE_ID }}
+  PROD_WORKSPACE_ID: ${{ vars.PROD_WORKSPACE_ID }}
+
+  GITHUB_REPOSITORY_NAME: ${{ github.event.repository.name }}
+  GITHUB_REPOSITORY_OWNER: ${{ github.event.repository.owner.login }}
+
+  FABRIC_VAR_FILE_PATH: variable_template.VariableLibrary/variables.json
+  FABRIC_CONNECTION_ID: ${{ vars.FABRIC_CONNECTION_ID }}
+  WORKSPACE_ADMIN_ID: ${{ vars.WORKSPACE_ADMIN_ID }}
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # 0. Validate Service Principal Permissions + Capture user commit msg
+  # ══════════════════════════════════════════════════════════════
+  check-spn-permissions:
+    name: "0. Validate SPN Permissions"
+    runs-on: ubuntu-latest
+
+    outputs:
+      user_commit_subject: ${{ steps.usermsg.outputs.subject }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Capture user commit subject (first line)
+        id: usermsg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            subject="$(printf "%s" "${{ github.event.head_commit.message }}" | sed -n '1p' | tr -d '\r')"
+          else
+            subject="manual run ${GITHUB_SHA}"
+          fi
+
+          # Optional guard: strip "chore:" if user accidentally used it
+          if [[ "$subject" =~ ^chore:\ * ]]; then
+            subject="${subject#chore: }"
+          fi
+
+          echo "subject=$subject" >> "$GITHUB_OUTPUT"
+
+      - name: Make script executable
+        run: chmod +x ./.github/workflows/scripts/spn_evaluator.sh
+
+      - name: Run SPN Evaluator
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          ./.github/workflows/scripts/spn_evaluator.sh --output table
+
+  # ══════════════════════════════════════════════════════════════
+  # 1. Create Feature Workspace (feature/**)
+  # ══════════════════════════════════════════════════════════════
+  create-feature-workspace:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "1. Create Feature Workspace"
+    needs: [check-spn-permissions]
+    uses: ./.github/workflows/create-fabric-workspace.yml
+    with:
+      branch-name: ${{ github.ref_name }}
+      workspace-prefix: feat
+      capacity-id: ${{ vars.DEV_CAPACITY_ID }}
+      git-branch: ${{ github.ref_name }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      workspace-admin-id: ${{ vars.WORKSPACE_ADMIN_ID }}
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+  # ══════════════════════════════════════════════════════════════
+  # 2. Update Variables for Dev (auto)
+  # ══════════════════════════════════════════════════════════════
+  update-dev-variables:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "2. Update Dev Variables"
+    needs: [create-feature-workspace, check-spn-permissions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set commit message (from user commit subject)
+        id: commitmsg
+        shell: bash
+        run: |
+          set -euo pipefail
+          msg="${{ needs.check-spn-permissions.outputs.user_commit_subject }}"
+          echo "message=${msg} [skip ci]" >> "$GITHUB_OUTPUT"
+
+      - name: Update variables.json for Dev
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          chmod +x ./.github/workflows/scripts/update_variables.sh
+          ./.github/workflows/scripts/update_variables.sh \
+            -p ${{ env.VAR_PREFIX }} \
+            -e DEV \
+            -f ${{ env.FABRIC_VAR_FILE_PATH }} \
+            -r ${{ github.repository }}
+
+      - name: Commit and push changes (merge all changes from this stage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "${{ steps.commitmsg.outputs.message }}"
+
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push
+
+  # ══════════════════════════════════════════════════════════════
+  # 3. Deploy to Dev (auto)
+  # ══════════════════════════════════════════════════════════════
+  deploy-to-dev:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "3. Deploy to Dev"
+    needs: [update-dev-variables]
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: ${{ github.ref_name }}
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
+  # 4. Wait for Test Approval
+  # ══════════════════════════════════════════════════════════════
+  wait-for-test-approval:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "4. Wait for Test Approval"
+    needs: [deploy-to-dev]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ env.APPROVER }}
+          minimum-approvals: 1
+          issue-title: "Deploy to Test Environment"
+          issue-body: "Please approve to proceed with TEST variable update + deployment."
+
+  # ══════════════════════════════════════════════════════════════
+  # 5. Update Variables for Test (after approval)
+  # ══════════════════════════════════════════════════════════════
+  update-test-variables:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "5. Update Test Variables"
+    needs: [wait-for-test-approval, check-spn-permissions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set commit message (from user commit subject)
+        id: commitmsg
+        shell: bash
+        run: |
+          set -euo pipefail
+          msg="${{ needs.check-spn-permissions.outputs.user_commit_subject }}"
+          echo "message=${msg} [skip ci]" >> "$GITHUB_OUTPUT"
+
+      - name: Update variables.json for Test
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          chmod +x ./.github/workflows/scripts/update_variables.sh
+          ./.github/workflows/scripts/update_variables.sh \
+            -p ${{ env.VAR_PREFIX }} \
+            -e TEST \
+            -f ${{ env.FABRIC_VAR_FILE_PATH }} \
+            -r ${{ github.repository }}
+
+      - name: Commit and push changes (merge all changes from this stage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "${{ steps.commitmsg.outputs.message }}"
+
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push
+
+  # ══════════════════════════════════════════════════════════════
+  # 6. Deploy to Test
+  # ══════════════════════════════════════════════════════════════
+  deploy-to-test:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "6. Deploy to Test"
+    needs: [update-test-variables]
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: ${{ github.ref_name }}
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
+  # 7. Create PR test -> main (manual merge)
+  # NOTE: requires create-gitflow-pr.yml to accept `pr-title`
+  # ══════════════════════════════════════════════════════════════
+  create-prod-pr:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "7. Create PR test -> main (manual merge)"
+    needs: [deploy-to-test, check-spn-permissions]
+    uses: ./.github/workflows/create-gitflow-pr.yml
+    with:
+      source-branch: test
+      target-branch: main
+      pr-title: ${{ needs.check-spn-permissions.outputs.user_commit_subject }}
+      auto-approve: false
+      auto-merge: false
+      delete-source-branch: false
+      squash: true
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ══════════════════════════════════════════════════════════════
+  # PROD FLOW (ONLY after PR merged test -> main)
+  # ══════════════════════════════════════════════════════════════
+  update-prod-variables:
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'test'
+    name: "8. Update Prod Variables"
+    needs: [create-prod-pr, check-spn-permissions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set commit message (from user commit subject)
+        id: commitmsg
+        shell: bash
+        run: |
+          set -euo pipefail
+          msg="${{ needs.check-spn-permissions.outputs.user_commit_subject }}"
+          echo "message=${msg} [skip ci]" >> "$GITHUB_OUTPUT"
+
+      - name: Update variables.json for Production
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          chmod +x ./.github/workflows/scripts/update_variables.sh
+          ./.github/workflows/scripts/update_variables.sh \
+            -p ${{ env.VAR_PREFIX }} \
+            -e PROD \
+            -f ${{ env.FABRIC_VAR_FILE_PATH }} \
+            -r ${{ github.repository }}
+
+      - name: Commit and push changes (merge all changes from this stage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "${{ steps.commitmsg.outputs.message }}"
+          git pull --rebase origin main
+          git push origin main
+
+  deploy-to-prod:
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'test'
+    name: "9. Deploy to Production"
+    needs: [update-prod-variables]
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ vars.PROD_WORKSPACE_ID }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: main
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}

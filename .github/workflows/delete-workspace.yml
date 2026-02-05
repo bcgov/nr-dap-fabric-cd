@@ -1,0 +1,47 @@
+#delete-workspace.yml
+name: Delete Fabric Workspace
+
+on:
+  workflow_call:
+    inputs:
+      workspace-name:
+        required: true
+        type: string
+        description: 'Name of the workspace to delete'
+    secrets:
+      AZURE_CREDENTIALS:
+        required: true
+
+jobs:
+  delete-workspace:
+    name: Delete Workspace
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Make script executable
+        run: chmod +x .github/workflows/scripts/delete_workspace.sh
+      
+      - name: Delete Workspace
+        run: .github/workflows/scripts/delete_workspace.sh
+        env:
+          WS_NAME: ${{ inputs.workspace-name }}
+      
+      - name: Summary
+        run: |
+          echo "### Workspace Deletion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workspace Name**: ${{ inputs.workspace-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: Deletion attempted successfully" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,108 @@
+# .github/workflows/create-fabric-workspace.yml
+name: Create Fabric Workspace
+
+on:
+  workflow_call:
+    inputs:
+      branch-name:
+        required: true
+        type: string
+        description: 'Branch name (e.g., feature/my-feature)'
+      workspace-prefix:
+        required: true
+        type: string
+        description: 'Workspace name prefix'
+      capacity-id:
+        required: true
+        type: string
+        description: 'Fabric capacity ID'
+      git-branch:
+        required: true
+        type: string
+        description: 'Git branch to link to workspace'
+      fabric-connection-id:
+        required: true
+        type: string
+        description: 'Fabric Git connection ID'
+      workspace-admin-id:
+        required: true
+        type: string
+        description: 'Workspace admin user/group ID'
+
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_CLIENT_SECRET:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+
+    outputs:
+      workspace-id:
+        description: 'ID of the created workspace'
+        value: ${{ jobs.create-workspace.outputs.workspace-id }}
+
+jobs:
+  create-workspace:
+    name: Create Workspace
+    runs-on: ubuntu-latest
+    outputs:
+      # FIX: Script outputs "workspace_id" (underscore), not "workspace-id"
+      workspace-id: ${{ steps.create-ws.outputs.workspace_id }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Make scripts executable
+        run: |
+          chmod +x .github/workflows/scripts/create_workspace.sh
+          chmod +x .github/workflows/scripts/add_ws_admin.sh
+
+      - name: Create Workspace
+        id: create-ws
+        run: .github/workflows/scripts/create_workspace.sh
+        env:
+          # Secrets for Auth
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+          # Script Inputs
+          BRANCH_NAME: ${{ inputs.branch-name }}
+          WS_PREFIX: ${{ inputs.workspace-prefix }}
+          CAPACITY_ID: ${{ inputs.capacity-id }}
+          FABRIC_CONNECTION_ID: ${{ inputs.fabric-connection-id }}
+
+          # Standard GitHub Env Vars
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Add Admin to Workspace
+        run: .github/workflows/scripts/add_ws_admin.sh
+        env:
+          # FIX: read the underscore output from create-ws
+          WS_ID: ${{ steps.create-ws.outputs.workspace_id }}
+          WORKSPACE_ADMIN_EMAIL: ${{ inputs.workspace-admin-id }}
+
+          # Pass secrets if add_ws_admin.sh needs to login again:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Summary
+        env:
+          WORKSPACE_ID: ${{ steps.create-ws.outputs.workspace_id }}
+          WORKSPACE_NAME: ${{ inputs.workspace-prefix }}-${{ inputs.branch-name }}
+        run: |
+          echo "### Workspace Creation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workspace Name**: $WORKSPACE_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workspace ID**: $WORKSPACE_ID" >> $GITHUB_STEP_SUMMARY
+          echo "- **Capacity ID**: ${{ inputs.capacity-id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git Branch**: ${{ inputs.git-branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Access URL**: https://app.fabric.microsoft.com/groups/$WORKSPACE_ID" >> $GITHUB_STEP_SUMMARY
