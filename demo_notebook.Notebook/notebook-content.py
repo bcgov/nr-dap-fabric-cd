@@ -12,7 +12,7 @@
 import os, platform
 from datetime import datetime, timezone
 
-print("Fabric Git smoke test ✅")
+print("Fabric Git smoke test feature demo 3✅")
 print("UTC now:", datetime.now(timezone.utc).isoformat())
 print("Python:", platform.python_version())
 print("Platform:", platform.platform())
