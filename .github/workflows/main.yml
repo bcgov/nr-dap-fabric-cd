@@ -118,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           msg="${{ needs.check-spn-permissions.outputs.user_commit_subject }}"
-          echo "message=${msg} [skip ci]" >> "$GITHUB_OUTPUT"
+          echo "message=${msg}[skip ci]" >> "$GITHUB_OUTPUT"
 
       - name: Update variables.json for Dev
         env:
@@ -252,13 +252,32 @@ jobs:
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
+  # 6.5. Create PR feature -> test (auto merge)
+  # ══════════════════════════════════════════════════════════════
+  create-test-pr:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "6.5. Create PR feature -> test (auto merge)"
+    needs: [deploy-to-test, check-spn-permissions]
+    uses: ./.github/workflows/create-gitflow-pr.yml
+    with:
+      source-branch: ${{ github.ref_name }}
+      target-branch: test
+      pr-title: ${{ needs.check-spn-permissions.outputs.user_commit_subject }}
+      auto-approve: true
+      auto-merge: true
+      delete-source-branch: false
+      squash: false
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ══════════════════════════════════════════════════════════════
   # 7. Create PR test -> main (manual merge)
   # NOTE: requires create-gitflow-pr.yml to accept `pr-title`
   # ══════════════════════════════════════════════════════════════
   create-prod-pr:
     if: startsWith(github.ref, 'refs/heads/feature/')
     name: "7. Create PR test -> main (manual merge)"
-    needs: [deploy-to-test, check-spn-permissions]
+    needs: [create-test-pr, check-spn-permissions]
     uses: ./.github/workflows/create-gitflow-pr.yml
     with:
       source-branch: test
@@ -281,7 +300,7 @@ jobs:
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.ref == 'test'
     name: "8. Update Prod Variables"
-    needs: [create-prod-pr, check-spn-permissions]
+    needs: [check-spn-permissions]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository (main)
