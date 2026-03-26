@@ -18,7 +18,7 @@ permissions:
 
 env:
   WS_PREFIX: feat
-  VAR_PREFIX: ENV_VAR
+  VAR_PREFIX: ENV_VARS
   APPROVER: Data-Alchemy
 
   DEV_CAPACITY_ID: ${{ vars.DEV_CAPACITY_ID }}
