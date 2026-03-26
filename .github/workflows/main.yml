@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - "main"
+      - "test"
     types: [closed]
   workflow_dispatch:
 
@@ -50,7 +51,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Capture user commit subject (first line)
+      - name: Capture user commit subject
         id: usermsg
         shell: bash
         run: |
@@ -58,6 +59,8 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "push" ]]; then
             subject="$(printf "%s" "${{ github.event.head_commit.message }}" | sed -n '1p' | tr -d '\r')"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            subject="${{ github.event.pull_request.title }}"
           else
             subject="manual run ${GITHUB_SHA}"
           fi
@@ -168,7 +171,7 @@ jobs:
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
-  # 4. Wait for Test Approval
+  # 4. Wait for Test Approval (Issue creation)
   # ══════════════════════════════════════════════════════════════
   wait-for-test-approval:
     if: startsWith(github.ref, 'refs/heads/feature/')
@@ -235,29 +238,56 @@ jobs:
           git push
 
   # ══════════════════════════════════════════════════════════════
-  # 6. Deploy to Test
+  # 6. Create PR feature -> test (MANUAL MERGE - Pipeline stops here)
+  # ══════════════════════════════════════════════════════════════
+  create-test-pr:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "6. Create PR feature -> test (Manual Approval Required)"
+    needs: [update-test-variables, check-spn-permissions]
+    uses: ./.github/workflows/create-gitflow-pr.yml
+    with:
+      source-branch: ${{ github.ref_name }}
+      target-branch: test
+      pr-title: ${{ needs.check-spn-permissions.outputs.user_commit_subject }}
+      auto-approve: false  # Pauses flow - user must approve PR
+      auto-merge: false    # Pauses flow - user must merge PR
+      delete-source-branch: false
+      squash: false
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # ══════════════════════════════════════════════════════════════
+  # 7. Deploy to Test (ONLY after PR merged feature -> test)
   # ══════════════════════════════════════════════════════════════
   deploy-to-test:
-    if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "6. Deploy to Test"
-    needs: [update-test-variables]
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'test' &&
+      startsWith(github.event.pull_request.head.ref, 'feature/')
+    name: "7. Deploy to Test"
+    needs: [check-spn-permissions]
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
       fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
-      git-branch: ${{ github.ref_name }}
+      git-branch: test
     secrets:
       tenant-id: ${{ secrets.AZURE_TENANT_ID }}
       client-id: ${{ secrets.AZURE_CLIENT_ID }}
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
-  # 7. Create PR test -> main (manual merge)
-  # NOTE: requires create-gitflow-pr.yml to accept `pr-title`
+  # 8. Create PR test -> main (manual merge)
   # ══════════════════════════════════════════════════════════════
   create-prod-pr:
-    if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "7. Create PR test -> main (manual merge)"
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'test' &&
+      startsWith(github.event.pull_request.head.ref, 'feature/')
+    name: "8. Create PR test -> main (manual merge)"
     needs: [deploy-to-test, check-spn-permissions]
     uses: ./.github/workflows/create-gitflow-pr.yml
     with:
@@ -280,8 +310,8 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.ref == 'test'
-    name: "8. Update Prod Variables"
-    needs: [create-prod-pr, check-spn-permissions]
+    name: "9. Update Prod Variables"
+    needs: [check-spn-permissions]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository (main)
@@ -332,7 +362,7 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.ref == 'test'
-    name: "9. Deploy to Production"
+    name: "10. Deploy to Production"
     needs: [update-prod-variables]
     uses: ./.github/workflows/update-workspace-git.yml
     with:
