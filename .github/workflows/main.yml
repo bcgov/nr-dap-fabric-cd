@@ -225,8 +225,10 @@ jobs:
           secret: ${{ github.TOKEN }}
           approvers: ${{ env.APPROVER }}
           minimum-approvals: 1
-          issue-title: "Deploy to Dev Environment"
-          issue-body: "Please approve to proceed with DEV workspace deployment."
+          issue-title: "Deploy to Dev Environment — ${{ github.ref_name }}"
+          issue-body: |
+            Feature branch: `${{ github.ref_name }}`
+            Please approve to proceed with DEV workspace deployment.
 
   # ══════════════════════════════════════════════════════════════
   # 6. Deploy to Dev (after approval)
@@ -247,7 +249,7 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════
   # 7. Wait for Test Approval
-  # Queued — only one feature branch can hold the test stage at a time
+  # Acquires test-branch-lock — queues concurrent feature branches here
   # ══════════════════════════════════════════════════════════════
   wait-for-test-approval:
     if: startsWith(github.ref, 'refs/heads/feature/')
@@ -271,7 +273,7 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════
   # 8. Update Variables for Test (after approval)
-  # Holds the test-branch-lock until deploy-to-test completes
+  # Holds test-branch-lock — no other feature can write to test branch
   # ══════════════════════════════════════════════════════════════
   update-test-variables:
     if: startsWith(github.ref, 'refs/heads/feature/')
@@ -328,15 +330,13 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════
   # 9. Deploy to Test
-  # Holds the test-branch-lock until complete then releases it
+  # No concurrency block — reusable workflow call, not compatible.
+  # Safe because update-test-variables held the lock exclusively.
   # ══════════════════════════════════════════════════════════════
   deploy-to-test:
     if: startsWith(github.ref, 'refs/heads/feature/')
     name: "9. Deploy to Test"
     needs: [update-test-variables]
-    concurrency:
-      group: test-branch-lock
-      cancel-in-progress: false
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
@@ -348,12 +348,29 @@ jobs:
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
+  # 9a. Release Test Lock
+  # Plain runs-on job after the reusable call to hold the lock
+  # until deploy-to-test fully completes before next feature proceeds
+  # ══════════════════════════════════════════════════════════════
+  release-test-lock:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "9a. Release Test Lock"
+    needs: [deploy-to-test]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: test-branch-lock
+      cancel-in-progress: false
+    steps:
+      - name: Test stage complete
+        run: echo "Test deployment complete for ${{ github.ref_name }} — releasing test-branch-lock"
+
+  # ══════════════════════════════════════════════════════════════
   # 10. Create PR test -> main (manual merge)
   # ══════════════════════════════════════════════════════════════
   create-prod-pr:
     if: startsWith(github.ref, 'refs/heads/feature/')
     name: "10. Create PR test -> main (manual merge)"
-    needs: [deploy-to-test, check-spn-permissions]
+    needs: [release-test-lock, check-spn-permissions]
     uses: ./.github/workflows/create-gitflow-pr.yml
     with:
       source-branch: test
@@ -433,9 +450,6 @@ jobs:
       github.event.pull_request.head.ref == 'test'
     name: "12. Deploy to Production"
     needs: [update-prod-variables]
-    concurrency:
-      group: main-branch-lock
-      cancel-in-progress: false
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.PROD_WORKSPACE_ID }}
@@ -445,3 +459,28 @@ jobs:
       tenant-id: ${{ secrets.AZURE_TENANT_ID }}
       client-id: ${{ secrets.AZURE_CLIENT_ID }}
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
+  # 12a. Release Main Lock
+  # Plain runs-on job after the reusable call to hold the lock
+  # until deploy-to-prod fully completes
+  # ══════════════════════════════════════════════════════════════
+  release-main-lock:
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'test'
+    name: "12a. Release Main Lock"
+    needs: [deploy-to-prod]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: main-branch-lock
+      cancel-in-progress: false
+    steps:
+      - name: Prod stage complete
+        run: echo "Production deployment complete — releasing main-branch-lock"
+
+  # ══════════════════════════════════════════════════════════════
+  # 13. Delete Feature Workspace (after prod deployment)
+  # ══════════════════════════════════════════════════════════════
