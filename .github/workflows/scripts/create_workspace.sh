@@ -150,6 +150,110 @@ connect_to_git() {
     fi
 }
 
+initialize_and_sync() {
+    local ws_id="$1"
+    local token="$2"
+
+    echo "Checking git status..." >&2
+    local status_resp=$(curl -s \
+        -H "Authorization: Bearer ${token}" \
+        "https://api.fabric.microsoft.com/v1/workspaces/${ws_id}/git/status")
+
+    local required_action=$(echo "$status_resp" | jq -r '.requiredAction // empty')
+    local workspace_head=$(echo "$status_resp"  | jq -r '.workspaceHead  // empty')
+    local remote_hash=$(echo "$status_resp"     | jq -r '.remoteCommitHash // empty')
+
+    echo "ℹ requiredAction=${required_action}, workspaceHead=${workspace_head:-null}, remoteCommitHash=${remote_hash:-null}" >&2
+
+    # ── Case 1: already initialized and in sync ──────────────────
+    if [[ -z "$required_action" || "$required_action" == "None" ]]; then
+        echo "✅ Workspace already in sync — nothing to do" >&2
+        return 0
+    fi
+
+    # ── Case 2: never initialized (workspaceHead is empty/null) ──
+    if [[ -z "$workspace_head" ]]; then
+        echo "Initializing git connection (first-time sync)..." >&2
+
+        local init_resp=$(curl -w "\n%{http_code}" -s -X POST \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d '{"initializationStrategy": "PreferRemote"}' \
+            "https://api.fabric.microsoft.com/v1/workspaces/${ws_id}/git/initializeConnection")
+
+        local init_code=$(echo "$init_resp" | tail -n1)
+        local init_body=$(echo "$init_resp" | sed '$d')
+
+        if [[ ! "$init_code" =~ ^2[0-9]{2}$ ]]; then
+            echo "❌ initializeConnection failed (HTTP $init_code):" >&2
+            echo "$init_body" >&2
+            exit 1
+        fi
+
+        echo "✅ initializeConnection succeeded (HTTP $init_code)" >&2
+
+        # Re-fetch status to get workspaceHead now that init is done
+        status_resp=$(curl -s \
+            -H "Authorization: Bearer ${token}" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${ws_id}/git/status")
+
+        required_action=$(echo "$status_resp" | jq -r '.requiredAction // empty')
+        workspace_head=$(echo "$status_resp"  | jq -r '.workspaceHead  // empty')
+        remote_hash=$(echo "$status_resp"     | jq -r '.remoteCommitHash // empty')
+
+        echo "ℹ post-init status: requiredAction=${required_action}, workspaceHead=${workspace_head:-null}" >&2
+
+        # If already in sync after init, we are done
+        if [[ -z "$required_action" || "$required_action" == "None" ]]; then
+            echo "✅ Workspace in sync after init — nothing more to do" >&2
+            return 0
+        fi
+    fi
+
+    # ── Case 3: initialized but needs UpdateFromGit ───────────────
+    if [[ "$required_action" == "UpdateFromGit" ]]; then
+        if [[ -z "$remote_hash" ]]; then
+            echo "❌ UpdateFromGit required but remoteCommitHash is missing" >&2
+            exit 1
+        fi
+
+        echo "Performing UpdateFromGit (remoteCommitHash=${remote_hash}, workspaceHead=${workspace_head:-null})..." >&2
+
+        local update_payload
+        if [[ -n "$workspace_head" ]]; then
+            update_payload=$(jq -n \
+                --arg remote "$remote_hash" \
+                --arg head "$workspace_head" \
+                '{"remoteCommitHash": $remote, "workspaceHead": $head, "conflictResolution": {"conflictResolutionType": "Workspace", "conflictResolutionPolicy": "PreferRemote"}}')
+        else
+            update_payload=$(jq -n \
+                --arg remote "$remote_hash" \
+                '{"remoteCommitHash": $remote, "conflictResolution": {"conflictResolutionType": "Workspace", "conflictResolutionPolicy": "PreferRemote"}}')
+        fi
+
+        local update_resp=$(curl -w "\n%{http_code}" -s -X POST \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "$update_payload" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${ws_id}/git/updateFromGit")
+
+        local update_code=$(echo "$update_resp" | tail -n1)
+        local update_body=$(echo "$update_resp" | sed '$d')
+
+        if [[ "$update_code" =~ ^2[0-9]{2}$ ]]; then
+            echo "✅ UpdateFromGit succeeded (HTTP $update_code)" >&2
+        else
+            echo "❌ UpdateFromGit failed (HTTP $update_code):" >&2
+            echo "$update_body" >&2
+            exit 1
+        fi
+
+        return 0
+    fi
+
+    echo "⚠️  Unhandled requiredAction='${required_action}' — skipping sync" >&2
+}
+
 # ══════════════════════════════════════════════════════════════
 # Main Execution
 # ══════════════════════════════════════════════════════════════
@@ -167,8 +271,10 @@ main() {
     fi
     
     echo "workspace_id=$WS_ID" >> "$GITHUB_OUTPUT"
+    echo "workspace_name=$NAME" >> "$GITHUB_OUTPUT"
     
     connect_to_git "$WS_ID" "$FABRIC_TOKEN"
+    initialize_and_sync "$WS_ID" "$FABRIC_TOKEN"
     
     echo "" >&2
     echo "All done! Fabric workspace ready." >&2
