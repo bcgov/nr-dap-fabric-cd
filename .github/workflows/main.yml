@@ -35,6 +35,8 @@ env:
   FABRIC_CONNECTION_ID: ${{ vars.FABRIC_CONNECTION_ID }}
   WORKSPACE_ADMIN_ID: ${{ vars.WORKSPACE_ADMIN_ID }}
 
+  FEATURE_WS_NAME_FILE: .github/feature-workspace.txt
+
 jobs:
   # ══════════════════════════════════════════════════════════════
   # 0. Validate Service Principal Permissions + Capture user commit msg
@@ -101,16 +103,58 @@ jobs:
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 
   # ══════════════════════════════════════════════════════════════
-  # 2. Update Variables for Dev (auto)
+  # 2. Persist Feature Workspace Name to file on feature branch
+  # ══════════════════════════════════════════════════════════════
+  persist-feature-workspace-name:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "2. Persist Feature Workspace Name"
+    needs: [create-feature-workspace, check-spn-permissions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Write workspace name to file
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ needs.create-feature-workspace.outputs.workspace-name }}" > ${{ env.FEATURE_WS_NAME_FILE }}
+
+      - name: Commit and push workspace name file
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add ${{ env.FEATURE_WS_NAME_FILE }}
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: persist feature workspace name [skip ci]"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push
+
+  # ══════════════════════════════════════════════════════════════
+  # 3. Update Variables for Dev (auto)
   # ══════════════════════════════════════════════════════════════
   update-dev-variables:
     if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "2. Update Dev Variables"
-    needs: [create-feature-workspace, check-spn-permissions]
+    name: "3. Update Dev Variables"
+    needs: [persist-feature-workspace-name, check-spn-permissions]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.GH_PAT }}
 
       - name: Set commit message (from user commit subject)
         id: commitmsg
@@ -147,16 +191,50 @@ jobs:
 
           git commit -m "${{ steps.commitmsg.outputs.message }}"
 
-          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git pull --rebase origin "${{ github.ref_name }}"
           git push
 
   # ══════════════════════════════════════════════════════════════
-  # 3. Deploy to Dev (auto)
+  # 4. Sync Feature Workspace with Git
+  # ══════════════════════════════════════════════════════════════
+  sync-feature-workspace:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "4. Sync Feature Workspace"
+    needs: [update-dev-variables, create-feature-workspace]
+    uses: ./.github/workflows/update-workspace-git.yml
+    with:
+      workspace-id: ${{ needs.create-feature-workspace.outputs.workspace-id }}
+      fabric-connection-id: ${{ vars.FABRIC_CONNECTION_ID }}
+      git-branch: ${{ github.ref_name }}
+    secrets:
+      tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+  # ══════════════════════════════════════════════════════════════
+  # 5. Wait for Dev Approval
+  # ══════════════════════════════════════════════════════════════
+  wait-for-dev-approval:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    name: "5. Wait for Dev Approval"
+    needs: [sync-feature-workspace]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ env.APPROVER }}
+          minimum-approvals: 1
+          issue-title: "Deploy to Dev Environment"
+          issue-body: "Please approve to proceed with DEV workspace deployment."
+
+  # ══════════════════════════════════════════════════════════════
+  # 6. Deploy to Dev (after approval)
   # ══════════════════════════════════════════════════════════════
   deploy-to-dev:
     if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "3. Deploy to Dev"
-    needs: [update-dev-variables]
+    name: "6. Deploy to Dev"
+    needs: [wait-for-dev-approval]
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.DEV_WORKSPACE_ID }}
@@ -168,33 +246,47 @@ jobs:
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
-  # 4. Wait for Test Approval
+  # 7. Wait for Test Approval
+  # Queued — only one feature branch can hold the test stage at a time
   # ══════════════════════════════════════════════════════════════
   wait-for-test-approval:
     if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "4. Wait for Test Approval"
+    name: "7. Wait for Test Approval"
     needs: [deploy-to-dev]
     runs-on: ubuntu-latest
+    concurrency:
+      group: test-branch-lock
+      cancel-in-progress: false
     steps:
       - uses: trstringer/manual-approval@v1
         with:
           secret: ${{ github.TOKEN }}
           approvers: ${{ env.APPROVER }}
           minimum-approvals: 1
-          issue-title: "Deploy to Test Environment"
-          issue-body: "Please approve to proceed with TEST variable update + deployment."
+          issue-title: "Deploy to Test Environment — ${{ github.ref_name }}"
+          issue-body: |
+            Feature branch: `${{ github.ref_name }}`
+            Please approve to proceed with TEST variable update + deployment.
+            **Note: other releases are queued behind this one.**
 
   # ══════════════════════════════════════════════════════════════
-  # 5. Update Variables for Test (after approval)
+  # 8. Update Variables for Test (after approval)
+  # Holds the test-branch-lock until deploy-to-test completes
   # ══════════════════════════════════════════════════════════════
   update-test-variables:
     if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "5. Update Test Variables"
+    name: "8. Update Test Variables"
     needs: [wait-for-test-approval, check-spn-permissions]
     runs-on: ubuntu-latest
+    concurrency:
+      group: test-branch-lock
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: test
+          token: ${{ secrets.GH_PAT }}
 
       - name: Set commit message (from user commit subject)
         id: commitmsg
@@ -231,16 +323,20 @@ jobs:
 
           git commit -m "${{ steps.commitmsg.outputs.message }}"
 
-          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git pull --rebase origin test
           git push
 
   # ══════════════════════════════════════════════════════════════
-  # 6. Deploy to Test
+  # 9. Deploy to Test
+  # Holds the test-branch-lock until complete then releases it
   # ══════════════════════════════════════════════════════════════
   deploy-to-test:
     if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "6. Deploy to Test"
+    name: "9. Deploy to Test"
     needs: [update-test-variables]
+    concurrency:
+      group: test-branch-lock
+      cancel-in-progress: false
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.TEST_WORKSPACE_ID }}
@@ -252,12 +348,11 @@ jobs:
       client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
   # ══════════════════════════════════════════════════════════════
-  # 7. Create PR test -> main (manual merge)
-  # NOTE: requires create-gitflow-pr.yml to accept `pr-title`
+  # 10. Create PR test -> main (manual merge)
   # ══════════════════════════════════════════════════════════════
   create-prod-pr:
     if: startsWith(github.ref, 'refs/heads/feature/')
-    name: "7. Create PR test -> main (manual merge)"
+    name: "10. Create PR test -> main (manual merge)"
     needs: [deploy-to-test, check-spn-permissions]
     uses: ./.github/workflows/create-gitflow-pr.yml
     with:
@@ -280,14 +375,18 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.ref == 'test'
-    name: "8. Update Prod Variables"
-    needs: [create-prod-pr, check-spn-permissions]
+    name: "11. Update Prod Variables"
+    needs: [check-spn-permissions]
     runs-on: ubuntu-latest
+    concurrency:
+      group: main-branch-lock
+      cancel-in-progress: false
     steps:
       - name: Checkout repository (main)
         uses: actions/checkout@v4
         with:
           ref: main
+          token: ${{ secrets.GH_PAT }}
 
       - name: Set commit message (from user commit subject)
         id: commitmsg
@@ -332,8 +431,11 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.ref == 'test'
-    name: "9. Deploy to Production"
+    name: "12. Deploy to Production"
     needs: [update-prod-variables]
+    concurrency:
+      group: main-branch-lock
+      cancel-in-progress: false
     uses: ./.github/workflows/update-workspace-git.yml
     with:
       workspace-id: ${{ vars.PROD_WORKSPACE_ID }}
